@@ -80,11 +80,14 @@ class Channel(ClosingContextManager):
 
     Because SSH2 has a windowing kind of flow control, if you stop reading data
     from a Channel and its buffer fills up, the server will be unable to send
-    you any more data until you read some of it.  (This won't affect other
-    channels on the same transport -- all channels on a single transport are
-    flow-controlled independently.)  Similarly, if the server isn't reading
-    data you send, calls to `send` may block, unless you set a timeout.  This
-    is exactly like a normal network socket, so it shouldn't be too surprising.
+    you any more data until you read some of it.  (Per-channel windows are
+    flow-controlled independently, though all channels on one transport also
+    draw from a single transport-wide inbound payload budget -- see
+    `Transport.__init__` -- so one transport can't buffer more than that
+    budget in total, no matter how many channels are open.)  Similarly, if the
+    server isn't reading data you send, calls to `send` may block, unless you
+    set a timeout.  This is exactly like a normal network socket, so it
+    shouldn't be too surprising.
 
     Instances of this class may be used as context managers.
     """
@@ -132,6 +135,16 @@ class Channel(ClosingContextManager):
         self.combine_stderr = False
         self.exit_status = -1
         self.origin_addr = None
+        # This channel's current share of the transport-wide inbound
+        # payload budget: bytes buffered but unread plus receive window
+        # still advertised to the peer. Set when the channel is opened.
+        self._global_window = 0
+        # Window credit the peer earned (we read data) but could not be
+        # granted because the shared budget was unavailable when an
+        # adjustment became due. Separate from ``in_window_sofar`` (which
+        # merely batches reads up to the threshold): debt is credit that
+        # is already overdue and must be granted as soon as quota frees.
+        self._global_window_debt = 0
 
     def __del__(self):
         try:
@@ -693,21 +706,7 @@ class Channel(ClosingContextManager):
         :raises socket.timeout:
             if no data is ready before the timeout set by `settimeout`.
         """
-        try:
-            out = self.in_buffer.read(nbytes, self.timeout)
-        except PipeTimeout:
-            raise socket.timeout()
-
-        ack = self._check_add_window(len(out))
-        # no need to hold the channel lock when sending this
-        if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
-
-        return out
+        return self._recv_buffer(self.in_buffer, nbytes)
 
     def recv_stderr_ready(self):
         """
@@ -730,8 +729,8 @@ class Channel(ClosingContextManager):
         `exec_command` or `invoke_shell` without a pty will ever have data
         on the stderr stream.  The return value is a string representing the
         data received.  The maximum amount of data to be received at once is
-        specified by ``nbytes``.  If a string of length zero is returned, the
-        channel stream has closed.
+        specified by ``nbytes``.  If a string of length zero is returned,
+        the channel stream has closed.
 
         :param int nbytes: maximum number of bytes to read.
         :return: received data as a `bytes`
@@ -741,19 +740,61 @@ class Channel(ClosingContextManager):
 
         .. versionadded:: 1.1
         """
+        return self._recv_buffer(self.in_stderr_buffer, nbytes)
+
+    # shared receive logic: regular and extended data use the same budget
+
+    def _recv_buffer(self, buffer_, nbytes):
+        # First, opportunistically send window credit that previously did
+        # not fit in the shared budget.
+        self._flush_window_debt()
         try:
-            out = self.in_stderr_buffer.read(nbytes, self.timeout)
+            out = buffer_.read(nbytes, self.timeout)
         except PipeTimeout:
             raise socket.timeout()
 
-        ack = self._check_add_window(len(out))
-        # no need to hold the channel lock when sending this
+        n = len(out)
+        if n:
+            self._payload_consumed(n)
+
+        ack = self._check_add_window(n)
         if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
+            # The adjustment is backed by the shared budget. Blocking
+            # channels wait for enough quota (a normal flow-control wait,
+            # never on the transport thread); non-blocking ones take what
+            # is available and remember the rest as debt.
+            if self.timeout == 0.0:
+                granted = self.transport._take_channel_window(ack)
+            else:
+                reserved = self.transport._reserve_channel_window(
+                    ack, timeout=self.timeout
+                )
+                granted = (
+                    ack if reserved else self.transport._take_channel_window(ack)
+                )
+            if granted < ack:
+                self._requeue_window(ack - granted)
+            if granted > 0:
+                give_back = False
+                self.lock.acquire()
+                try:
+                    if self.closed or not self.active:
+                        # closed while we weren't holding the lock; don't
+                        # grant credit to a dead channel -- return it.
+                        give_back = True
+                    else:
+                        self._global_window += granted
+                finally:
+                    self.lock.release()
+                if give_back:
+                    self.transport._release_channel_window(granted)
+                else:
+                    m = Message()
+                    m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+                    m.add_int(self.remote_chanid)
+                    m.add_int(granted)
+                    # no need to hold the channel lock when sending this
+                    self.transport._send_user_message(m)
 
         return out
 
@@ -1037,6 +1078,9 @@ class Channel(ClosingContextManager):
                 self.transport._send_user_message(m)
 
     def _feed(self, m):
+        # New data arriving means the peer is unblocked: use the chance to
+        # grant window credit previously withheld due to budget exhaustion.
+        self._flush_window_debt()
         if isinstance(m, bytes):
             # passed from _feed_extended
             s = m
@@ -1045,6 +1089,7 @@ class Channel(ClosingContextManager):
         self.in_buffer.feed(s)
 
     def _feed_extended(self, m):
+        self._flush_window_debt()
         code = m.get_int()
         s = m.get_binary()
         if code != 1:
@@ -1053,7 +1098,8 @@ class Channel(ClosingContextManager):
             )
             return
         if self.combine_stderr:
-            self._feed(s)
+            # avoid a second debt flush via _feed; the one above is enough
+            self.in_buffer.feed(s)
         else:
             self.in_stderr_buffer.feed(s)
 
@@ -1234,6 +1280,18 @@ class Channel(ClosingContextManager):
         self.status_event.set()
         if self._pipe is not None:
             self._pipe.set_forever()
+        # Return everything still reserved on this channel's behalf: both
+        # buffered-but-unread payload and receive window the peer will no
+        # longer be able to use. This wakes any thread blocked reserving
+        # quota (e.g. an open_channel caller).
+        if self._global_window and self.transport is not None:
+            amount = self._global_window
+            self._global_window = 0
+            self.transport._release_channel_window(amount)
+        # Overdue debt was already returned to the pool when its bytes were
+        # read; the peer can't use the credit now, so drop the claim rather
+        # than ever granting it.
+        self._global_window_debt = 0
 
     def _send_eof(self):
         # you are holding the lock.
@@ -1290,6 +1348,90 @@ class Channel(ClosingContextManager):
             return out
         finally:
             self.lock.release()
+
+    def _payload_consumed(self, n):
+        """
+        ``n`` payload bytes were read off one of this channel's inbound
+        buffers: shrink this channel's reserved exposure and return the
+        bytes to the transport-wide budget.
+        """
+        self.lock.acquire()
+        try:
+            if self.closed or not self.active:
+                # the close path already returned the whole balance; avoid
+                # returning these bytes a second time.
+                return
+            self._global_window -= n
+        finally:
+            self.lock.release()
+        self.transport._release_channel_window(n)
+
+    def _requeue_window(self, n):
+        """
+        Remember ``n`` bytes of a window adjustment that could not be
+        backed by the shared budget as debt, so the credit is granted as
+        soon as quota becomes available.
+        """
+        self.lock.acquire()
+        try:
+            self._global_window_debt += n
+        finally:
+            self.lock.release()
+
+    def _flush_window_debt(self):
+        """
+        Grant window credit previously withheld because the transport-wide
+        budget was exhausted.
+
+        Non-blocking and safe to call from any thread: when invoked on the
+        transport thread the adjustment is sent directly (waiting on
+        ``clear_to_send`` would self-deadlock that thread); other threads
+        go through the regular user-message path that yields during key
+        exchange.
+        """
+        self.lock.acquire()
+        try:
+            debt = self._global_window_debt
+            if debt <= 0 or self.closed or not self.active:
+                return
+            # On the transport thread we may not inject non-kex packets
+            # while a key exchange is in progress; retry after it ends.
+            if (
+                threading.current_thread() is self.transport
+                and self.transport.kex_engine is not None
+            ):
+                return
+        finally:
+            self.lock.release()
+        granted = self.transport._take_channel_window(debt)
+        if granted <= 0:
+            return
+        self.lock.acquire()
+        try:
+            if (
+                self.closed
+                or not self.active
+                or granted > self._global_window_debt
+            ):
+                # state changed while the lock was free
+                give_back = True
+            else:
+                self._global_window_debt -= granted
+                self._global_window += granted
+                give_back = False
+        finally:
+            self.lock.release()
+        if give_back:
+            self.transport._release_channel_window(granted)
+            return
+        m = Message()
+        m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+        m.add_int(self.remote_chanid)
+        m.add_int(granted)
+        if threading.current_thread() is self.transport:
+            self.transport._send_message(m)
+        else:
+            self.transport._send_user_message(m)
 
     def _wait_for_send_window(self, size):
         """

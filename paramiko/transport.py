@@ -44,6 +44,7 @@ from paramiko.channel import Channel
 from paramiko.common import (
     CONNECTION_FAILED_CODE,
     DEBUG,
+    DEFAULT_GLOBAL_WINDOW_FACTOR,
     DEFAULT_MAX_PACKET_SIZE,
     DEFAULT_WINDOW_SIZE,
     ERROR,
@@ -76,6 +77,7 @@ from paramiko.common import (
     MSG_SERVICE_ACCEPT,
     MSG_UNIMPLEMENTED,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_FAILED_RESOURCE_SHORTAGE,
     OPEN_SUCCEEDED,
     WARNING,
     byte_ord,
@@ -357,6 +359,7 @@ class Transport(threading.Thread, ClosingContextManager):
         server_sig_algs=True,
         strict_kex=True,
         packetizer_class=None,
+        default_global_window_size=None,
     ):
         """
         Create a new SSH session over an existing socket, or socket-like
@@ -424,6 +427,18 @@ class Transport(threading.Thread, ClosingContextManager):
         :param packetizer_class:
             Which class to use for instantiating the internal packet handler.
             Default: ``None`` (i.e.: use `Packetizer` as normal).
+
+        :param int default_global_window_size:
+            Transport-wide budget (in bytes) for *unconsumed* inbound channel
+            payload data. All channels multiplexed over this transport draw
+            from this single budget, with regular and extended data (stdout
+            and stderr) sharing it. Bytes are returned to the budget as they
+            are read off a channel, when a channel closes, or if a channel
+            open attempt fails. When the budget is exhausted, requesting new
+            channels blocks until other channels release quota, but key
+            re-exchange is never prevented. Defaults to ``None``, which means
+            ``default_window_size * DEFAULT_GLOBAL_WINDOW_FACTOR`` (i.e.
+            four regular channel windows).
 
         .. versionchanged:: 1.15
             Added the ``default_window_size`` and ``default_max_packet_size``
@@ -515,6 +530,19 @@ class Transport(threading.Thread, ClosingContextManager):
         self._channel_counter = 0
         self.default_max_packet_size = default_max_packet_size
         self.default_window_size = default_window_size
+        # Transport-wide budget for inbound channel payload data (stdout and
+        # stderr, across all channels). Reserve on channel open / window
+        # adjustments; release on read, close, or failed opens.
+        if default_global_window_size is None:
+            default_global_window_size = (
+                default_window_size * DEFAULT_GLOBAL_WINDOW_FACTOR
+            )
+        self.default_global_window_size = default_global_window_size
+        self._global_window_left = default_global_window_size
+        self._global_window_lock = threading.Lock()
+        self._global_window_cv = threading.Condition(
+            self._global_window_lock
+        )
         self._forward_agent_handler = None
         self._x11_handler = None
         self._tcp_handler = None
@@ -1019,34 +1047,50 @@ class Transport(threading.Thread, ClosingContextManager):
         if not self.active:
             raise SSHException("SSH session not active")
         timeout = self.channel_timeout if timeout is None else timeout
-        self.lock.acquire()
+        window_size = self._sanitize_window_size(window_size)
+        max_packet_size = self._sanitize_packet_size(max_packet_size)
+        # Reserve this channel's initial window from the transport-wide
+        # budget before doing anything else. This may block while other
+        # channels hold the budget, but the wait happens on the caller's
+        # thread -- the transport thread keeps running, so key re-exchange
+        # is unaffected.
+        if not self._reserve_channel_window(window_size, timeout=timeout):
+            raise SSHException("Timeout opening channel.")
+        registered = False
         try:
-            window_size = self._sanitize_window_size(window_size)
-            max_packet_size = self._sanitize_packet_size(max_packet_size)
-            chanid = self._next_channel()
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_OPEN)
-            m.add_string(kind)
-            m.add_int(chanid)
-            m.add_int(window_size)
-            m.add_int(max_packet_size)
-            if (kind == "forwarded-tcpip") or (kind == "direct-tcpip"):
-                m.add_string(dest_addr[0])
-                m.add_int(dest_addr[1])
-                m.add_string(src_addr[0])
-                m.add_int(src_addr[1])
-            elif kind == "x11":
-                m.add_string(src_addr[0])
-                m.add_int(src_addr[1])
-            chan = Channel(chanid)
-            self._channels.put(chanid, chan)
-            self.channel_events[chanid] = event = threading.Event()
-            self.channels_seen[chanid] = True
-            chan._set_transport(self)
-            chan._set_window(window_size, max_packet_size)
+            self.lock.acquire()
+            try:
+                chanid = self._next_channel()
+                m = Message()
+                m.add_byte(cMSG_CHANNEL_OPEN)
+                m.add_string(kind)
+                m.add_int(chanid)
+                m.add_int(window_size)
+                m.add_int(max_packet_size)
+                if (kind == "forwarded-tcpip") or (kind == "direct-tcpip"):
+                    m.add_string(dest_addr[0])
+                    m.add_int(dest_addr[1])
+                    m.add_string(src_addr[0])
+                    m.add_int(src_addr[1])
+                elif kind == "x11":
+                    m.add_string(src_addr[0])
+                    m.add_int(src_addr[1])
+                chan = Channel(chanid)
+                chan._global_window = window_size
+                self._channels.put(chanid, chan)
+                self.channel_events[chanid] = event = threading.Event()
+                self.channels_seen[chanid] = True
+                chan._set_transport(self)
+                chan._set_window(window_size, max_packet_size)
+                registered = True
+            finally:
+                self.lock.release()
+            self._send_user_message(m)
         finally:
-            self.lock.release()
-        self._send_user_message(m)
+            # If we never linked the channel in (eg. transport died mid
+            # setup), give the reservation straight back so it isn't leaked.
+            if not registered:
+                self._release_channel_window(window_size)
         start_ts = time.time()
         while True:
             event.wait(0.1)
@@ -1806,6 +1850,84 @@ class Transport(threading.Thread, ClosingContextManager):
     def _unlink_channel(self, chanid):
         """used by a Channel to remove itself from the active channel list"""
         self._channels.delete(chanid)
+
+    # Transport-wide inbound channel payload budget.
+    #
+    # The budget backs the total receive window currently advertised across
+    # all channels (bytes the peer may still send plus payload already
+    # buffered but not yet read). Channels reserve when opened (and when
+    # sending window adjustments), and release when data is read, the
+    # channel closes, or an open attempt fails.
+    #
+    # Lock ordering note: callers may hold a channel lock while invoking
+    # ``_release_channel_window`` / ``_take_channel_window`` (channel ->
+    # global order). Never hold the global lock while acquiring a channel
+    # lock.
+
+    def _reserve_channel_window(self, nbytes, timeout=None):
+        """
+        Reserve exactly ``nbytes`` from the transport-wide inbound channel
+        payload budget, blocking until enough quota has been returned.
+
+        The wait happens on a dedicated condition variable without holding
+        the transport lock or any channel lock, so the transport thread --
+        and therefore key re-exchange -- keeps running while callers wait.
+
+        :param float timeout:
+            maximum seconds to wait; ``None`` waits (almost) forever.
+
+        :return:
+            ``True`` if the full amount was reserved; ``False`` on timeout.
+
+        :raises:
+            `.SSHException` -- if the transport dies while waiting.
+        """
+        deadline = None if timeout is None else time.time() + timeout
+        self._global_window_cv.acquire()
+        try:
+            while self._global_window_left < nbytes:
+                if not self.active:
+                    raise SSHException("SSH session not active")
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0.0:
+                        return False
+                    self._global_window_cv.wait(remaining)
+                else:
+                    # wake periodically so the active check actually runs
+                    self._global_window_cv.wait(self._active_check_timeout)
+            self._global_window_left -= nbytes
+            return True
+        finally:
+            self._global_window_cv.release()
+
+    def _take_channel_window(self, nbytes):
+        """
+        Non-blocking reserve: take up to ``nbytes`` from the budget.
+
+        :return:
+            the number of bytes actually reserved, as an `int` (may be zero).
+        """
+        self._global_window_lock.acquire()
+        try:
+            got = min(nbytes, self._global_window_left)
+            self._global_window_left -= got
+            return got
+        finally:
+            self._global_window_lock.release()
+
+    def _release_channel_window(self, nbytes):
+        """
+        Return ``nbytes`` previously reserved bytes to the budget and wake
+        any threads waiting to reserve (for example, blocked
+        ``open_channel`` callers).
+        """
+        self._global_window_cv.acquire()
+        try:
+            self._global_window_left += nbytes
+            self._global_window_cv.notify_all()
+        finally:
+            self._global_window_cv.release()
 
     def _send_message(self, data):
         self.packetizer.send_message(data)
@@ -2867,6 +2989,12 @@ class Transport(threading.Thread, ClosingContextManager):
                 chanid, reason_str, reason_text
             ),
         )
+        # The channel's initial window was reserved when OPEN was sent;
+        # return it now that the open has failed.
+        chan = self._channels.get(chanid)
+        if chan is not None and chan._global_window:
+            self._release_channel_window(chan._global_window)
+            chan._global_window = 0
         self.lock.acquire()
         try:
             self.saved_exception = ChannelException(reason, reason_text)
@@ -2959,6 +3087,18 @@ class Transport(threading.Thread, ClosingContextManager):
                     'Rejecting "{}" channel request from client.'.format(kind),
                 )
                 reject = True
+        if not reject:
+            # Try to back this channel's initial receive window from the
+            # shared budget. The transport thread can't block here (that
+            # would stall the whole connection, including key exchange), so
+            # if the budget can't cover a full window right now, refuse
+            # with "resource shortage" instead.
+            got = self._take_channel_window(self.default_window_size)
+            if got < self.default_window_size:
+                if got:
+                    self._release_channel_window(got)
+                reason = OPEN_FAILED_RESOURCE_SHORTAGE
+                reject = True
         if reject:
             msg = Message()
             msg.add_byte(cMSG_CHANNEL_OPEN_FAILURE)
@@ -2970,6 +3110,7 @@ class Transport(threading.Thread, ClosingContextManager):
             return
 
         chan = Channel(my_chanid)
+        chan._global_window = self.default_window_size
         self.lock.acquire()
         try:
             self._channels.put(my_chanid, chan)

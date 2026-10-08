@@ -232,6 +232,11 @@ io_sleep = 0.01
 DEFAULT_WINDOW_SIZE = 64 * 2**15
 DEFAULT_MAX_PACKET_SIZE = 2**15
 
+# Default transport-wide budget for inbound channel payload bytes, as a
+# multiple of the default per-channel window size. All channels on one
+# transport (stdout and stderr alike) draw from this shared budget.
+DEFAULT_GLOBAL_WINDOW_FACTOR = 4
+
 # lower bound on the max packet size we'll accept from the remote host
 # Minimum packet size is 32768 bytes according to
 # http://www.ietf.org/rfc/rfc4254.txt
