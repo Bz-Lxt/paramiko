@@ -23,6 +23,8 @@ Server-mode SFTP support.
 import errno
 import os
 import sys
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from hashlib import md5, sha1
 
 from paramiko import util
@@ -97,6 +99,7 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         server,
         sftp_si=SFTPServerInterface,
         *args,
+        max_concurrent_requests=None,
         **kwargs,
     ):
         """
@@ -112,6 +115,26 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         :param sftp_si:
             a subclass of `.SFTPServerInterface` to use for handling individual
             requests.
+        :param int max_concurrent_requests:
+            optional bound on how many requests may be processed at the same
+            time.  When unset (or ``1``), every request is handled inline on
+            the session thread, in arrival order -- the historical behavior.
+            When set to an integer greater than ``1``, independent requests
+            are dispatched to a bounded worker pool, so a slow operation on
+            one file no longer blocks requests for other files; requests that
+            finish first are answered first (the SFTP protocol matches
+            replies to requests by request id regardless of order).
+            Operations targeting the same open handle (read, write, fstat,
+            fsetstat, check-file, close -- and readdir/close for directory
+            handles) always run one at a time, in the order the client sent
+            them, in particular close never overtakes a preceding read or
+            write.  Note that with concurrency enabled, methods of the
+            ``sftp_si`` implementation may be invoked from worker threads at
+            the same time, so any shared state they rely on must be
+            thread-safe.
+
+        .. versionadded:: 5.0
+            The ``max_concurrent_requests`` parameter.
         """
         BaseSFTP.__init__(self)
         SubsystemHandler.__init__(self, channel, name, server)
@@ -122,6 +145,27 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         # map of handle-string to SFTPHandle for files & folders:
         self.file_table = {}
         self.folder_table = {}
+        # serialize packet sends and handle-table mutation from worker
+        # threads, so neither response bytes nor the tables can interleave
+        self._send_lock = threading.Lock()
+        self._table_lock = threading.Lock()
+        # optional bounded concurrency:
+        if max_concurrent_requests is not None and max_concurrent_requests > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=max_concurrent_requests,
+                thread_name_prefix="sftp-worker",
+            )
+            # bounds the number of requests accepted but not yet finished,
+            # so a fast client with slow backends cannot queue work forever
+            self._request_slots = threading.BoundedSemaphore(
+                max_concurrent_requests
+            )
+            # tail future of the per-handle serialization chain:
+            # handle-string -> Future
+            self._chains_lock = threading.Lock()
+            self._chains = {}
+        else:
+            self._executor = None
         self.server = sftp_si(server, *args, **kwargs)
 
     def _log(self, level, msg):
@@ -146,30 +190,47 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
                 self._log(DEBUG, "Exception on channel: " + str(e))
                 self._log(DEBUG, util.tb_strings())
                 return
+            if self._executor is None:
+                # legacy, fully synchronous mode
+                msg = Message(data)
+                request_number = msg.get_int()
+                self._run_request(t, request_number, msg)
+                continue
+            # backpressure: wait until an outstanding request finished;
+            # re-check the channel periodically so a client disconnect is
+            # noticed even when all worker slots are busy
+            while not self._request_slots.acquire(timeout=0.5):
+                if not self.sock.active or self.sock.closed:
+                    self._log(DEBUG, "Channel inactive -- end of session")
+                    return
             msg = Message(data)
             request_number = msg.get_int()
-            try:
-                self._process(t, request_number, msg)
-            except Exception as e:
-                self._log(DEBUG, "Exception in server processing: " + str(e))
-                self._log(DEBUG, util.tb_strings())
-                # send some kind of failure message, at least
-                try:
-                    self._send_status(request_number, SFTP_FAILURE)
-                except:
-                    pass
+            key = self._request_key(t, Message(data))
+            self._schedule_request(key, t, request_number, msg)
 
     def finish_subsystem(self):
-        self.server.session_ended()
-        super().finish_subsystem()
+        if self._executor is None:
+            self.server.session_ended()
+            super().finish_subsystem()
+        else:
+            # close the channel first: any worker blocked trying to send a
+            # reply to a vanished client fails fast instead of waiting
+            # forever for a window, then drain the in-flight requests
+            # (queued ones can no longer be delivered, so cancel them)
+            super().finish_subsystem()
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self.server.session_ended()
         # close any file handles that were left open
         # (so we can return them to the OS quickly)
-        for f in self.file_table.values():
+        with self._table_lock:
+            files = list(self.file_table.values())
+            folders = list(self.folder_table.values())
+            self.file_table = {}
+            self.folder_table = {}
+        for f in files:
             f.close()
-        for f in self.folder_table.values():
+        for f in folders:
             f.close()
-        self.file_table = {}
-        self.folder_table = {}
 
     @staticmethod
     def convert_errno(e):
@@ -219,6 +280,94 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
 
     # ...internals...
 
+    def _send_packet(self, t, packet):
+        # worker threads may answer at the same time, so make sure whole
+        # packets reach the channel without being interleaved
+        with self._send_lock:
+            super()._send_packet(t, packet)
+
+    def _run_request(self, t, request_number, msg):
+        try:
+            self._process(t, request_number, msg)
+        except Exception as e:
+            self._log(DEBUG, "Exception in server processing: " + str(e))
+            self._log(DEBUG, util.tb_strings())
+            # send some kind of failure message, at least
+            try:
+                self._send_status(request_number, SFTP_FAILURE)
+            except Exception:
+                # the channel may be gone already; nothing else to do
+                pass
+
+    @staticmethod
+    def _request_key(t, msg):
+        """
+        Return the open-handle identifier a request must be ordered
+        against, or ``None`` for requests that are independent of any
+        open handle and may run concurrently.
+        """
+        msg.get_int()  # request number
+        if t in (
+            CMD_CLOSE,
+            CMD_READ,
+            CMD_WRITE,
+            CMD_FSTAT,
+            CMD_FSETSTAT,
+            CMD_READDIR,
+        ):
+            return msg.get_binary()
+        if t == CMD_EXTENDED:
+            tag = msg.get_text()
+            if tag == "check-file":
+                return msg.get_binary()
+        return None
+
+    def _schedule_request(self, key, t, request_number, msg):
+        def work():
+            try:
+                self._run_request(t, request_number, msg)
+            finally:
+                self._request_slots.release()
+
+        if key is None:
+            self._executor.submit(work)
+            return
+
+        # Chain the request behind any earlier one still running on the
+        # same handle, so operations on a given handle execute one at a
+        # time and strictly in the client's send order (in particular,
+        # close waits for preceding reads/writes).
+        with self._chains_lock:
+            previous = self._chains.get(key)
+            slot = Future()
+            self._chains[key] = slot
+
+        def run_chain(_future=None):
+            try:
+                self._run_request(t, request_number, msg)
+            finally:
+                self._request_slots.release()
+                with self._chains_lock:
+                    if self._chains.get(key) is slot:
+                        del self._chains[key]
+                slot.set_result(None)
+
+        if previous is None:
+            self._executor.submit(run_chain)
+        else:
+            # the callback only re-queues (cheap and non-blocking, even if
+            # it happens to fire on the reader thread); the actual work
+            # always runs inside the bounded pool
+            def queue_next(_future):
+                try:
+                    self._executor.submit(run_chain)
+                except RuntimeError:
+                    # the pool is already shutting down (session ending);
+                    # the queued request can no longer be answered
+                    self._request_slots.release()
+
+            previous.add_done_callback(queue_next)
+
     def _response(self, request_number, t, *args):
         msg = Message()
         msg.add_int(request_number)
@@ -243,13 +392,15 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             # must be error code
             self._send_status(request_number, handle)
             return
-        handle._set_name(b("hx{:d}".format(self.next_handle)))
-        self.next_handle += 1
-        if folder:
-            self.folder_table[handle._get_name()] = handle
-        else:
-            self.file_table[handle._get_name()] = handle
-        self._response(request_number, CMD_HANDLE, handle._get_name())
+        with self._table_lock:
+            name = b("hx{:d}".format(self.next_handle))
+            self.next_handle += 1
+            handle._set_name(name)
+            if folder:
+                self.folder_table[name] = handle
+            else:
+                self.file_table[name] = handle
+        self._response(request_number, CMD_HANDLE, name)
 
     def _send_status(self, request_number, code, desc=None):
         if desc is None:
@@ -296,12 +447,13 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         start = msg.get_int64()
         length = msg.get_int64()
         block_size = msg.get_int()
-        if handle not in self.file_table:
+        with self._table_lock:
+            f = self.file_table.get(handle)
+        if f is None:
             self._send_status(
                 request_number, SFTP_BAD_MESSAGE, "Invalid handle"
             )
             return
-        f = self.file_table[handle]
         for x in alg_list:
             # TODO: this only contains sha1 and md5 so uh, is this extension
             # actually supported anymore? do we need to update the map for
@@ -385,28 +537,38 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             )
         elif t == CMD_CLOSE:
             handle = msg.get_binary()
-            if handle in self.folder_table:
-                del self.folder_table[handle]
+            # unregister before closing (close() may block); per-handle
+            # request chaining guarantees no read/write is still running
+            with self._table_lock:
+                if handle in self.folder_table:
+                    del self.folder_table[handle]
+                    folder_closed = True
+                    f = None
+                else:
+                    folder_closed = False
+                    f = self.file_table.pop(handle, None)
+            if folder_closed:
                 self._send_status(request_number, SFTP_OK)
                 return
-            if handle in self.file_table:
-                self.file_table[handle].close()
-                del self.file_table[handle]
-                self._send_status(request_number, SFTP_OK)
-                return
-            self._send_status(
-                request_number, SFTP_BAD_MESSAGE, "Invalid handle"
-            )
-        elif t == CMD_READ:
-            handle = msg.get_binary()
-            offset = msg.get_int64()
-            length = msg.get_int()
-            if handle not in self.file_table:
+            if f is None:
                 self._send_status(
                     request_number, SFTP_BAD_MESSAGE, "Invalid handle"
                 )
                 return
-            data = self.file_table[handle].read(offset, length)
+            f.close()
+            self._send_status(request_number, SFTP_OK)
+        elif t == CMD_READ:
+            handle = msg.get_binary()
+            offset = msg.get_int64()
+            length = msg.get_int()
+            with self._table_lock:
+                f = self.file_table.get(handle)
+            if f is None:
+                self._send_status(
+                    request_number, SFTP_BAD_MESSAGE, "Invalid handle"
+                )
+                return
+            data = f.read(offset, length)
             if isinstance(data, (bytes, str)):
                 if len(data) == 0:
                     self._send_status(request_number, SFTP_EOF)
@@ -418,14 +580,14 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             handle = msg.get_binary()
             offset = msg.get_int64()
             data = msg.get_binary()
-            if handle not in self.file_table:
+            with self._table_lock:
+                f = self.file_table.get(handle)
+            if f is None:
                 self._send_status(
                     request_number, SFTP_BAD_MESSAGE, "Invalid handle"
                 )
                 return
-            self._send_status(
-                request_number, self.file_table[handle].write(offset, data)
-            )
+            self._send_status(request_number, f.write(offset, data))
         elif t == CMD_REMOVE:
             path = msg.get_text()
             self._send_status(request_number, self.server.remove(path))
@@ -448,12 +610,13 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
             return
         elif t == CMD_READDIR:
             handle = msg.get_binary()
-            if handle not in self.folder_table:
+            with self._table_lock:
+                folder = self.folder_table.get(handle)
+            if folder is None:
                 self._send_status(
                     request_number, SFTP_BAD_MESSAGE, "Invalid handle"
                 )
                 return
-            folder = self.folder_table[handle]
             self._read_folder(request_number, folder)
         elif t == CMD_STAT:
             path = msg.get_text()
@@ -471,12 +634,14 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
                 self._send_status(request_number, resp)
         elif t == CMD_FSTAT:
             handle = msg.get_binary()
-            if handle not in self.file_table:
+            with self._table_lock:
+                f = self.file_table.get(handle)
+            if f is None:
                 self._send_status(
                     request_number, SFTP_BAD_MESSAGE, "Invalid handle"
                 )
                 return
-            resp = self.file_table[handle].stat()
+            resp = f.stat()
             if issubclass(type(resp), SFTPAttributes):
                 self._response(request_number, CMD_ATTRS, resp)
             else:
@@ -488,14 +653,14 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         elif t == CMD_FSETSTAT:
             handle = msg.get_binary()
             attr = SFTPAttributes._from_msg(msg)
-            if handle not in self.file_table:
-                self._response(
+            with self._table_lock:
+                f = self.file_table.get(handle)
+            if f is None:
+                self._send_status(
                     request_number, SFTP_BAD_MESSAGE, "Invalid handle"
                 )
                 return
-            self._send_status(
-                request_number, self.file_table[handle].chattr(attr)
-            )
+            self._send_status(request_number, f.chattr(attr))
         elif t == CMD_READLINK:
             path = msg.get_text()
             resp = self.server.readlink(path)
