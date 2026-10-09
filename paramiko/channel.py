@@ -72,6 +72,284 @@ def open_only(func):
     return _check
 
 
+class ChannelSendScheduler:
+    """
+    Weighted, work-conserving scheduler for outbound channel data.
+
+    All of the open channels on a single `.Transport` funnel their
+    ``CHANNEL_DATA`` writes through one of these objects.  A channel that
+    wins a send turn keeps it (its follow-up packets take a fast path)
+    until either:
+
+    * after charging a packet, some parked contender has a virtual byte
+      clock (``bytes_sent / weight``) no larger than its own, in which
+      case the turn is yielded -- ties go to the contender so a bulk
+      sender can never monopolize the connection; or
+    * it stops sending while another channel wants the turn: a turn
+      holder idle between packets for longer than the preemption grace
+      period is preempted by any contender (spare capacity is never
+      reserved for an idle channel); within the grace window only a
+      contender whose virtual clock is no worse may preempt, so the
+      tiny scheduling gaps between a bulk sender's packets cannot
+      distort the weighted share, and a channel waiting on a remote
+      window never contends at all.
+
+    Ratios are compared with integer cross multiplication so no floating
+    point drift is possible.  Bytes are charged to the winning channel
+    only after its packet has actually been written; failed sends are
+    not charged.
+    """
+
+    #: Max time a contender may wait behind an idle turn holder before
+    #: taking spare capacity regardless of virtual clocks.
+    IDLE_GRACE = 0.002
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        # Set once the underlying transport is dead; all pending turns fail.
+        self._closed = False
+        # chanid of the channel currently holding the send turn.
+        self._current = None
+        # True while the turn holder is actually writing a packet; a False
+        # value with a current owner means it is between sends.
+        self._inflight = False
+        # monotonic() timestamp of the last commit, used to tell a truly
+        # idle holder apart from a bulk sender between two packets.
+        self._idle_since = None
+        # chanid -> arrival sequence, parked contenders.
+        self._waiting = {}
+        # chanid -> configured weight (positive int).
+        self._weights = {}
+        # chanid -> payload bytes charged so far.
+        self._sent = {}
+        self._seq = 0
+
+    @staticmethod
+    def _coerce_weight(weight):
+        if (
+            not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight < 1
+        ):
+            raise ValueError("channel send weight must be a positive int")
+        return weight
+
+    def set_weight(self, chanid, weight):
+        """Set (or register) the weight of a channel."""
+        weight = self._coerce_weight(weight)
+        with self._cond:
+            self._weights[chanid] = weight
+            # a weight change may make a different channel eligible
+            self._cond.notify_all()
+
+    def acquire(self, channel, timeout=None):
+        """
+        Obtain a send turn for ``channel``.
+
+        :returns:
+            ``True`` if a turn was granted.  ``False`` if the channel was
+            closed or unlinked while waiting (the caller must report zero
+            bytes sent).
+        :raises socket.timeout: if ``timeout`` elapsed before a turn.
+        :raises OSError: if the transport was closed while waiting.
+        """
+        chanid = channel.chanid
+        deadline = (
+            None if timeout is None else time.monotonic() + timeout
+        )
+        with self._cond:
+            if self._closed:
+                raise OSError("Connection is closed.")
+            self._weights.setdefault(
+                chanid, self._coerce_weight(channel.send_weight)
+            )
+            self._sent.setdefault(chanid, 0)
+            # Fast path: the channel still owns a turn from its previous
+            # packet and simply continues sending.
+            if self._current == chanid:
+                if channel.closed:
+                    self._current = None
+                    self._inflight = False
+                    self._cond.notify_all()
+                    return False
+                self._inflight = True
+                self._idle_since = None
+                return True
+            self._enqueue(chanid)
+            try:
+                while True:
+                    if self._closed:
+                        raise OSError("Connection is closed.")
+                    if channel.closed or chanid not in self._weights:
+                        self._waiting.pop(chanid, None)
+                        self._cond.notify_all()
+                        return False
+                    if self._current is None:
+                        if self._pick_locked() == chanid:
+                            self._current = chanid
+                            self._inflight = True
+                            self._idle_since = None
+                            self._waiting.pop(chanid, None)
+                            return True
+                    elif self._may_preempt_locked(chanid):
+                        # Either the holder has been idle between packets
+                        # past the grace period, or this contender's virtual
+                        # clock is no worse than its.  Revoke the turn and
+                        # let the parked contenders be picked fairly.
+                        self._current = None
+                        self._idle_since = None
+                        self._cond.notify_all()
+                        continue
+                    # Holder actively writing or still within its idle grace
+                    # with a better virtual clock: park (bounded by the grace
+                    # period so an idle holder can be replaced promptly).
+                    if deadline is not None:
+                        remaining = min(
+                            deadline - time.monotonic(), self.IDLE_GRACE
+                        )
+                        if remaining <= 0:
+                            self._waiting.pop(chanid, None)
+                            self._cond.notify_all()
+                            raise socket.timeout()
+                    else:
+                        remaining = self.IDLE_GRACE
+                    self._cond.wait(remaining)
+            except BaseException:
+                # Make sure a departing waiter can never mask the next winner.
+                self._waiting.pop(chanid, None)
+                self._cond.notify_all()
+                raise
+
+    def commit(self, chanid, nbytes):
+        """Charge ``nbytes`` after a successful packet write."""
+        retain = True
+        with self._cond:
+            if self._current == chanid and chanid in self._weights:
+                self._sent[chanid] += nbytes
+            self._inflight = False
+            self._idle_since = time.monotonic()
+            if self._current == chanid and self._waiting:
+                # Keep the turn only while this channel is strictly more
+                # eligible than every parked contender; ties (and worse
+                # ratios) yield the turn.
+                best = self._pick_locked()
+                if not self._ratio_lt(chanid, best):
+                    self._current = None
+                    self._cond.notify_all()
+                    retain = False
+        if retain:
+            # The turn is retained for the next packet.  Yield the GIL with
+            # all locks released so another thread that wants to contend
+            # can actually enter acquire() and enqueue; without this a
+            # tight send loop could finish an entire scheduling quantum
+            # before its peer ever gets scheduled (a real socket write
+            # drops the GIL anyway, this makes handoff deterministic).
+            time.sleep(0)
+
+    def _ratio_lt(self, lhs_chan, rhs_chan):
+        # Caller holds the lock.  True iff sent[lhs]/w[lhs] is strictly
+        # less than sent[rhs]/w[rhs] (integer cross multiplication).
+        return (
+            self._sent.get(lhs_chan, 0)
+            * self._weights.get(rhs_chan, 1)
+        ) < (
+            self._sent.get(rhs_chan, 0)
+            * self._weights.get(lhs_chan, 1)
+        )
+
+    def _ratio_le(self, lhs_chan, rhs_chan):
+        # As _ratio_lt but non-strict (ties let the contender preempt).
+        return (
+            self._sent.get(lhs_chan, 0)
+            * self._weights.get(rhs_chan, 1)
+        ) <= (
+            self._sent.get(rhs_chan, 0)
+            * self._weights.get(lhs_chan, 1)
+        )
+
+    def _may_preempt_locked(self, chanid):
+        # Caller holds the lock; a different channel currently owns the
+        # turn and is not actively writing a packet.
+        owner = self._current
+        if owner is None or owner == chanid or self._inflight:
+            return False
+        # A contender no worse than the holder may take over at once --
+        # including on a tie, which keeps a continuous bulk sender from
+        # owning the turn through scheduling gaps.
+        if self._ratio_le(chanid, owner):
+            return True
+        # A less eligible contender only gets spare capacity once the
+        # holder has actually gone idle, past the grace period.
+        return (
+            self._idle_since is not None
+            and time.monotonic() - self._idle_since >= self.IDLE_GRACE
+        )
+
+    def fault(self, chanid):
+        """Release a turn after the packet write itself failed."""
+        with self._cond:
+            if self._current == chanid:
+                self._current = None
+            self._inflight = False
+            self._idle_since = None
+            self._waiting.pop(chanid, None)
+            self._cond.notify_all()
+
+    def remove(self, chanid):
+        """Forget a channel that was unlinked from the transport."""
+        with self._cond:
+            self._weights.pop(chanid, None)
+            self._sent.pop(chanid, None)
+            self._waiting.pop(chanid, None)
+            if self._current == chanid:
+                self._current = None
+                self._inflight = False
+                self._idle_since = None
+            self._cond.notify_all()
+
+    def notify(self):
+        """Wake every waiter so it can re-check channel state."""
+        with self._cond:
+            self._cond.notify_all()
+
+    def close(self):
+        """Mark the scheduler dead; no further turns can be granted."""
+        with self._cond:
+            self._closed = True
+            self._current = None
+            self._inflight = False
+            self._idle_since = None
+            self._cond.notify_all()
+
+    def _enqueue(self, chanid):
+        # Caller holds the lock.  Re-entering while already queued or holding
+        # the turn keeps the original arrival position.
+        if chanid != self._current and chanid not in self._waiting:
+            self._seq += 1
+            self._waiting[chanid] = self._seq
+
+    def _pick_locked(self):
+        """
+        Return the chanid that should send next, or ``None``.
+
+        Caller holds the lock.  Selection uses the smallest
+        ``sent / weight`` ratio; ratios are compared with integer
+        cross-multiplication so no floating point drift is possible.
+        """
+        best = None
+        for chanid, seq in self._waiting.items():
+            if best is None:
+                best = chanid
+                continue
+            weight = self._weights.get(chanid, 1)
+            best_weight = self._weights.get(best, 1)
+            lhs = self._sent.get(chanid, 0) * best_weight
+            rhs = self._sent.get(best, 0) * weight
+            if lhs < rhs or (lhs == rhs and seq < self._waiting[best]):
+                best = chanid
+        return best
+
+
 class Channel(ClosingContextManager):
     """
     A secure tunnel across an SSH `.Transport`.  A Channel is meant to behave
@@ -116,6 +394,11 @@ class Channel(ClosingContextManager):
         self.closed = False
         self.ultra_debug = False
         self.lock = threading.Lock()
+        # Serializes every outbound message (data *and* EOF/CLOSE) for this
+        # channel, preserving byte order even with concurrent send() callers.
+        # The transport thread never acquires this lock, so it cannot join a
+        # rekey/close deadlock.
+        self._xmit_lock = threading.Lock()
         self.out_buffer_cv = threading.Condition(self.lock)
         self.in_window_size = 0
         self.out_window_size = 0
@@ -132,6 +415,9 @@ class Channel(ClosingContextManager):
         self.combine_stderr = False
         self.exit_status = -1
         self.origin_addr = None
+        #: Relative share of the Transport's outbound bandwidth when
+        #: several channels send data at the same time (positive int).
+        self.send_weight = 1
 
     def __del__(self):
         try:
@@ -583,6 +869,31 @@ class Channel(ClosingContextManager):
 
     # ...socket API...
 
+    def set_send_weight(self, weight):
+        """
+        Configure this channel's relative share of the `.Transport`
+        outbound bandwidth when more than one channel has data to send.
+
+        A channel with weight 3 is scheduled roughly three times as many
+        bytes as a channel with weight 1.  Weights only divide bandwidth
+        between channels that are actively sending; an idle (or
+        zero-remote-window) channel never consumes capacity, and control
+        messages such as EOF/CLOSE are not scheduled.
+
+        The default weight is ``1`` and may be changed at any time,
+        including before the channel is attached to a transport.
+
+        :param int weight: positive integer weight.
+
+        :raises ValueError: if ``weight`` is not a positive integer.
+        """
+        ChannelSendScheduler._coerce_weight(weight)
+        self.send_weight = weight
+        if self.transport is not None:
+            self.transport._channel_scheduler.set_weight(
+                self.chanid, weight
+            )
+
     def settimeout(self, timeout):
         """
         Set a timeout on blocking read/write operations.  The ``timeout``
@@ -664,9 +975,12 @@ class Channel(ClosingContextManager):
             msgs = self._close_internal()
         finally:
             self.lock.release()
-        for m in msgs:
-            if m is not None:
-                self.transport._send_user_message(m)
+        # Wait for any in-flight data packet to finish so EOF/CLOSE cannot
+        # overtake user data on the wire.
+        with self._xmit_lock:
+            for m in msgs:
+                if m is not None:
+                    self.transport._send_user_message(m)
 
     def recv_ready(self):
         """
@@ -956,13 +1270,16 @@ class Channel(ClosingContextManager):
             # feign "read" shutdown
             self.eof_received = 1
         if (how == 1) or (how == 2):
-            self.lock.acquire()
-            try:
-                m = self._send_eof()
-            finally:
-                self.lock.release()
-            if m is not None and self.transport is not None:
-                self.transport._send_user_message(m)
+            # Serialize against data sends so the EOF marker cannot leap
+            # ahead of bytes still being written.
+            with self._xmit_lock:
+                self.lock.acquire()
+                try:
+                    m = self._send_eof()
+                finally:
+                    self.lock.release()
+                if m is not None and self.transport is not None:
+                    self.transport._send_user_message(m)
 
     def shutdown_read(self):
         """
@@ -999,6 +1316,9 @@ class Channel(ClosingContextManager):
     def _set_transport(self, transport):
         self.transport = transport
         self.logger = util.get_logger(self.transport.get_log_channel())
+        transport._channel_scheduler.set_weight(
+            self.chanid, self.send_weight
+        )
 
     def _set_window(self, window_size, max_packet_size):
         self.in_window_size = window_size
@@ -1032,9 +1352,10 @@ class Channel(ClosingContextManager):
             msgs = self._close_internal()
         finally:
             self.lock.release()
-        for m in msgs:
-            if m is not None:
-                self.transport._send_user_message(m)
+        with self._xmit_lock:
+            for m in msgs:
+                if m is not None:
+                    self.transport._send_user_message(m)
 
     def _feed(self, m):
         if isinstance(m, bytes):
@@ -1180,31 +1501,64 @@ class Channel(ClosingContextManager):
             self.transport._unlink_channel(self.chanid)
         finally:
             self.lock.release()
-        for m in msgs:
-            if m is not None:
-                self.transport._send_user_message(m)
+        # _close_internal/_unlink_channel have woken every sender parked on
+        # this channel; once the last data send releases the transmit lock,
+        # EOF/CLOSE go out after (never before) its data.
+        with self._xmit_lock:
+            for m in msgs:
+                if m is not None:
+                    self.transport._send_user_message(m)
 
     # ...internals...
 
     def _send(self, s, m):
         size = len(s)
+        start = time.monotonic()
+        # Serialize the whole outbound transaction (window accounting,
+        # scheduling and the actual packet write) per channel.  This keeps
+        # byte order stable across concurrent send() callers and pairs every
+        # window deduction with exactly one write outcome.  The channel
+        # lock is still released before touching the transport, preserving
+        # the existing rekey deadlock avoidance.
+        with self._xmit_lock:
+            self.lock.acquire()
+            try:
+                if self.closed:
+                    # this doesn't seem useful, but it is the documented
+                    # behavior of Socket
+                    raise socket.error("Socket is closed")
+                size = self._wait_for_send_window(size)
+                if size == 0:
+                    # eof or similar
+                    return 0
+                m.add_string(s[:size])
+            finally:
+                self.lock.release()
+            try:
+                # Goes through the Transport's weighted channel scheduler
+                # and the rekey gate; returns 0 if the channel was closed
+                # while waiting for its turn.
+                return self.transport._send_channel_data(
+                    self, m, size, start
+                )
+            except Exception:
+                # Nothing reached the wire (scheduler/rekey timeout or a
+                # dead connection): hand the deducted remote window back so
+                # accounting stays accurate for a later retry.
+                self._restore_send_window(size)
+                raise
+
+    def _restore_send_window(self, size):
+        """Refund remote window credit deducted by an aborted send."""
+        if size == 0:
+            return
         self.lock.acquire()
         try:
-            if self.closed:
-                # this doesn't seem useful, but it is the documented behavior
-                # of Socket
-                raise socket.error("Socket is closed")
-            size = self._wait_for_send_window(size)
-            if size == 0:
-                # eof or similar
-                return 0
-            m.add_string(s[:size])
+            if not self.closed and not self.eof_sent:
+                self.out_window_size += size
+                self.out_buffer_cv.notify_all()
         finally:
             self.lock.release()
-        # Note: We release self.lock before calling _send_user_message.
-        # Otherwise, we can deadlock during re-keying.
-        self.transport._send_user_message(m)
-        return size
 
     def _log(self, level, msg, *args):
         self.logger.log(level, "[chan " + self._name + "] " + msg, *args)
@@ -1229,6 +1583,10 @@ class Channel(ClosingContextManager):
         self.in_buffer.close()
         self.in_stderr_buffer.close()
         self.out_buffer_cv.notify_all()
+        # Wake any send thread parked in the weighted scheduler; it cannot
+        # send on a closed channel.
+        if self.transport is not None:
+            self.transport._channel_scheduler.notify()
         # Notify any waiters that we are closed
         self.event.set()
         self.status_event.set()

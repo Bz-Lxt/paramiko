@@ -40,7 +40,7 @@ from cryptography.hazmat.primitives.ciphers import (
 import paramiko
 from paramiko import util
 from paramiko.auth_handler import AuthHandler, AuthOnlyHandler
-from paramiko.channel import Channel
+from paramiko.channel import Channel, ChannelSendScheduler
 from paramiko.common import (
     CONNECTION_FAILED_CODE,
     DEBUG,
@@ -510,6 +510,8 @@ class Transport(threading.Thread, ClosingContextManager):
 
         # tracking open channels
         self._channels = ChannelMap()
+        # weighted scheduler sharing outbound bandwidth between channels
+        self._channel_scheduler = ChannelSendScheduler()
         self.channel_events = {}  # (id -> Event)
         self.channels_seen = {}  # (id -> True)
         self._channel_counter = 0
@@ -1764,6 +1766,8 @@ class Transport(threading.Thread, ClosingContextManager):
 
     def stop_thread(self):
         self.active = False
+        # Wake any threads waiting on weighted channel send turns.
+        self._channel_scheduler.close()
         self.packetizer.close()
         # Keep trying to join() our main thread, quickly, until:
         # * We join()ed successfully (self.is_alive() == False)
@@ -1806,9 +1810,72 @@ class Transport(threading.Thread, ClosingContextManager):
     def _unlink_channel(self, chanid):
         """used by a Channel to remove itself from the active channel list"""
         self._channels.delete(chanid)
+        self._channel_scheduler.remove(chanid)
 
     def _send_message(self, data):
         self.packetizer.send_message(data)
+
+    def _send_channel_data(self, channel, data, size, started):
+        """
+        Send one ``CHANNEL_DATA`` payload through the weighted,
+        work-conserving channel scheduler.
+
+        The caller already holds the channel's per-channel transmit lock,
+        which guarantees per-channel byte ordering.  The weighted turn is
+        taken before crossing the rekey gate, so every contending channel
+        is visible to the scheduler at decision time; a key exchange is
+        connection-wide anyway and simply stalls the granted turn until it
+        completes.
+
+        :returns:
+            number of bytes sent (``size``), or 0 if the channel was closed
+            while waiting for its turn.
+        :raises:
+            `socket.timeout` -- the channel timeout elapsed before a turn.
+            `SSHException` -- key exchange took too long.
+            `OSError` -- the connection is dead; nothing was written.
+        """
+        remaining = None
+        if channel.timeout is not None:
+            remaining = channel.timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise socket.timeout()
+        granted = self._channel_scheduler.acquire(channel, remaining)
+        if not granted:
+            # closed/unlinked while queued for a turn; window wait
+            # semantics report this as zero bytes.
+            return 0
+        try:
+            # Block while a key exchange is in flight, exactly like
+            # _send_user_message -- but report a dead connection instead of
+            # silently dropping the packet, so send() cannot return a bogus
+            # positive byte count.  The gate lock is held only across the
+            # write, never across scheduler waits.
+            start = time.time()
+            while True:
+                self.clear_to_send.wait(0.1)
+                if not self.active:
+                    raise OSError("Connection is closed.")
+                self.clear_to_send_lock.acquire()
+                if self.clear_to_send.is_set():
+                    break
+                self.clear_to_send_lock.release()
+                if time.time() > start + self.clear_to_send_timeout:
+                    raise SSHException(
+                        "Key-exchange timed out waiting for key negotiation"
+                    )
+            try:
+                self._send_message(data)
+            finally:
+                self.clear_to_send_lock.release()
+        except BaseException:
+            # Gate failure or a failed write (typically a dead socket):
+            # free the turn without charging bytes; the caller reports the
+            # exception rather than a byte count.
+            self._channel_scheduler.fault(channel.chanid)
+            raise
+        self._channel_scheduler.commit(channel.chanid, size)
+        return size
 
     def _send_user_message(self, data):
         """
@@ -2167,6 +2234,7 @@ class Transport(threading.Thread, ClosingContextManager):
                 chan._unlink()
             if self.active:
                 self.active = False
+                self._channel_scheduler.close()
                 self.packetizer.close()
                 if self.completion_event is not None:
                     self.completion_event.set()
