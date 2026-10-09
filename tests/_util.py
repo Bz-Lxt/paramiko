@@ -16,6 +16,7 @@ from paramiko import (
     AUTH_SUCCESSFUL,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
     OPEN_SUCCEEDED,
+    AuthDeferred,
     Ed25519Key,
     InteractiveQuery,
     RSAKey,
@@ -92,6 +93,12 @@ class TestServer(ServerInterface):
 
     def __init__(self, allowed_keys=None):
         self.allowed_keys = allowed_keys if allowed_keys is not None else []
+        # Latest deferred auth objects handed back by the check_auth_* hooks,
+        # for tests that want to complete authentication out of band.
+        self.deferred_password = None
+        self.deferred_publickey = None
+        self.deferred_interactive = None
+        self.deferred_paranoid_did_password = False
 
     def check_channel_request(self, kind, chanid):
         if kind == "bogus":
@@ -155,7 +162,15 @@ class TestServer(ServerInterface):
                 return "publickey"
             else:
                 return "password"
-        if username == "commie":
+        if username == "deferred":
+            return "publickey,password"
+        if username == "deferred-paranoid":
+            return (
+                "publickey"
+                if self.deferred_paranoid_did_password
+                else "publickey,password"
+            )
+        if username in ("commie", "deferred-commie"):
             return "keyboard-interactive"
         if username == "utf8":
             return "password"
@@ -172,6 +187,11 @@ class TestServer(ServerInterface):
             if self.paranoid_did_public_key:
                 return AUTH_SUCCESSFUL
             return AUTH_PARTIALLY_SUCCESSFUL
+        if username in ("deferred", "deferred-paranoid"):
+            # verdict is supplied later, via tests calling
+            # ``server_object.deferred_password.complete(...)``
+            self.deferred_password = AuthDeferred()
+            return self.deferred_password
         if (username == "utf8") and (password == unicodey):
             return AUTH_SUCCESSFUL
         if (username == "non-utf8") and (password == "\xff"):
@@ -190,6 +210,22 @@ class TestServer(ServerInterface):
             if self.paranoid_did_password:
                 return AUTH_SUCCESSFUL
             return AUTH_PARTIALLY_SUCCESSFUL
+        if username == "deferred":
+            # verdict is supplied later, via tests calling
+            # ``server_object.deferred_publickey.complete(...)``
+            if key in self.allowed_keys:
+                self.deferred_publickey = AuthDeferred()
+                return self.deferred_publickey
+            return AUTH_FAILED
+        if (username == "deferred-paranoid") and (
+            key == self.paranoid_key
+        ):
+            # second (immediate) round following a deferred partial password
+            return (
+                AUTH_SUCCESSFUL
+                if self.deferred_paranoid_did_password
+                else AUTH_PARTIALLY_SUCCESSFUL
+            )
         # TODO: make sure all tests incidentally using this to pass, _without
         # sending a username oops_, get updated somehow - probably via server()
         # default always injecting a username
@@ -203,10 +239,15 @@ class TestServer(ServerInterface):
             return InteractiveQuery(
                 "password", "Please enter a password.", ("Password", False)
             )
+        if username == "deferred-commie":
+            # query itself is supplied later via ``deferred_interactive``
+            self.username = username
+            self.deferred_interactive = AuthDeferred()
+            return self.deferred_interactive
         return AUTH_FAILED
 
     def check_auth_interactive_response(self, responses):
-        if self.username == "commie":
+        if self.username in ("commie", "deferred-commie"):
             if (len(responses) == 1) and (responses[0] == "cat"):
                 return AUTH_SUCCESSFUL
         return AUTH_FAILED

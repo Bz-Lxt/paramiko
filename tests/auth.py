@@ -4,13 +4,19 @@ Tests focusing primarily on the authentication step.
 Thus, they concern AuthHandler and AuthStrategy, with a side of Transport.
 """
 
+import threading
+import time
 from logging import Logger
 from unittest.mock import Mock
 
 from pytest import raises
 
 from paramiko import (
+    AUTH_FAILED,
+    AUTH_PARTIALLY_SUCCESSFUL,
+    AUTH_SUCCESSFUL,
     AgentKey,
+    AuthDeferred,
     AuthenticationException,
     AuthFailure,
     AuthResult,
@@ -19,6 +25,7 @@ from paramiko import (
     BadAuthenticationType,
     Ed25519Key,
     InMemoryPrivateKey,
+    InteractiveQuery,
     NoneAuth,
     OnDiskPrivateKey,
     Password,
@@ -33,6 +40,7 @@ from ._util import (
     _support,
     server,
     unicodey,
+    wait_until,
 )
 
 
@@ -147,6 +155,225 @@ class AuthHandler_:
             tc.auth_timeout = 1  # 1 second, to speed up test
             tc.auth_password("unresponsive-server", "hello")
             assert "Authentication timeout" in str(info.value)
+
+    def deferred_password_success(self):
+        """
+        a password check that returns an AuthDeferred can be completed
+        successfully from another thread, later.
+        """
+        with server(defer=True) as (tc, ts):
+            def run():
+                tc.auth_password("deferred", "slow secret")
+
+            def parked():
+                assert ts.server_object.deferred_password is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            # not authenticated while the decision is outstanding
+            assert not ts.is_authenticated()
+            verdict = ts.server_object.deferred_password
+            verdict.complete(AUTH_SUCCESSFUL)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert ts.is_authenticated()
+            assert tc.is_authenticated()
+            assert verdict.result == AUTH_SUCCESSFUL
+
+    def deferred_password_failure(self):
+        """
+        an AuthDeferred completed with AUTH_FAILED rejects the client.
+        """
+        with server(defer=True, skip_verify=True) as (tc, ts):
+            def run():
+                try:
+                    tc.auth_password("deferred", "wrong")
+                except AuthenticationException:
+                    pass
+
+            def parked():
+                assert ts.server_object.deferred_password is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            ts.server_object.deferred_password.complete(AUTH_FAILED)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert not ts.is_authenticated()
+            assert not tc.is_active() or not tc.is_authenticated()
+
+    def deferred_publickey_success(self):
+        """
+        a deferred publickey verdict still verifies the client signature.
+        """
+        privkey = RSAKey.from_private_key_file(_support("rsa.key"))
+
+        def run():
+            tc.auth_publickey(username="deferred", key=privkey)
+
+        with server(defer=True, pubkeys=[privkey]) as (tc, ts):
+            def parked():
+                assert ts.server_object.deferred_publickey is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            ts.server_object.deferred_publickey.complete(AUTH_SUCCESSFUL)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert ts.is_authenticated()
+            assert tc.is_authenticated()
+
+    def deferred_multipart_auth(self):
+        """
+        an AuthDeferred completed PARTIALLY_SUCCESSFUL allows another round.
+        """
+        with server(defer=True) as (tc, ts):
+            srv = ts.server_object
+            outcome = {}
+
+            def run():
+                try:
+                    outcome["allowed"] = tc.auth_password(
+                        "deferred-paranoid", "paranoid"
+                    )
+                except Exception as e:
+                    outcome["error"] = e
+
+            def parked():
+                assert srv.deferred_password is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            srv.deferred_paranoid_did_password = True
+            srv.deferred_password.complete(AUTH_PARTIALLY_SUCCESSFUL)
+            thread.join(2)
+            assert not thread.is_alive()
+            assert outcome.get("allowed") == ["publickey"]
+            assert not ts.is_authenticated()
+            # second, immediate round completes authentication
+            key = Ed25519Key.from_private_key_file(_support("ed25519.key"))
+            assert tc.auth_publickey("deferred-paranoid", key) == []
+            assert ts.is_authenticated()
+
+    def deferred_interactive_auth(self):
+        """
+        a deferred keyboard-interactive check can complete with a query.
+        """
+
+        def handler(title, instructions, prompts):
+            return ["cat"]
+
+        def run():
+            tc.auth_interactive("deferred-commie", handler)
+
+        with server(defer=True) as (tc, ts):
+            srv = ts.server_object
+
+            def parked():
+                assert srv.deferred_interactive is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            srv.deferred_interactive.complete(
+                InteractiveQuery(
+                    "password", "Please enter a password.", ("Password", False)
+                )
+            )
+            thread.join(2)
+            assert not thread.is_alive()
+            assert ts.is_authenticated()
+            assert tc.is_authenticated()
+
+    def deferred_verdict_allows_rekey_while_pending(self):
+        """
+        while a deferred verdict is outstanding, the server still processes
+        unrelated protocol messages - such as a client-initiated rekey - and a
+        verdict landing mid-rekey is delivered (in order) afterwards.
+        """
+        with server(defer=True) as (tc, ts):
+            def run():
+                tc.auth_password("deferred", "secret")
+
+            def parked():
+                assert ts.server_object.deferred_password is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            # force a rekey directly from the client, mid-auth, then deliver
+            # the verdict while the rekey is still in flight
+            original_H = tc.H
+            tc._send_kex_init()
+            time.sleep(0.05)
+            ts.server_object.deferred_password.complete(AUTH_SUCCESSFUL)
+            thread.join(5)
+            assert not thread.is_alive()
+            assert ts.is_authenticated()
+            assert tc.is_authenticated()
+
+            def rekeyed():
+                assert tc.H != original_H
+
+            wait_until(rekeyed)
+
+    def deferred_verdict_after_disconnect_is_ignored(self):
+        """
+        completing an AuthDeferred after the client disconnected is harmless
+        and must not flip the (dead) connection's auth state.
+        """
+        with server(defer=True, skip_verify=True) as (tc, ts):
+            srv = ts.server_object
+
+            def run():
+                try:
+                    tc.auth_password("deferred", "secret")
+                except Exception:
+                    pass
+
+            def parked():
+                assert srv.deferred_password is not None
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(parked)
+            tc.close()
+
+            def server_dead():
+                assert not ts.is_active()
+
+            wait_until(server_dead)
+            # late verdict: silently dropped, no exception
+            srv.deferred_password.complete(AUTH_SUCCESSFUL)
+            assert not ts.is_authenticated()
+            thread.join(2)
+
+    def deferred_verdict_is_single_use(self):
+        """
+        AuthDeferred.complete can only supply a verdict once.
+        """
+        deferred = AuthDeferred()
+        assert not deferred.ready()
+        assert deferred.result is None
+        deferred.complete(AUTH_SUCCESSFUL)
+        assert deferred.ready()
+        assert deferred.result == AUTH_SUCCESSFUL
+        with raises(SSHException):
+            deferred.complete(AUTH_FAILED)
+
+    def deferred_bound_after_completion_fires_immediately(self):
+        """
+        a verdict supplied before the handler binds still gets delivered.
+        """
+        deferred = AuthDeferred()
+        deferred.complete(AUTH_FAILED)
+        seen = []
+        deferred._bind(seen.append)
+        assert seen == [AUTH_FAILED]
 
 
 class SHA2SignaturePubkeys:

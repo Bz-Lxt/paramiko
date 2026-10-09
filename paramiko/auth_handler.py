@@ -53,7 +53,7 @@ from paramiko.common import (
     cMSG_USERAUTH_SUCCESS,
 )
 from paramiko.message import Message
-from paramiko.server import InteractiveQuery
+from paramiko.server import AuthDeferred, InteractiveQuery
 from paramiko.ssh_exception import (
     AuthenticationException,
     BadAuthenticationType,
@@ -82,6 +82,11 @@ class AuthHandler:
         # for server mode:
         self.auth_username = None
         self.auth_fail_count = 0
+        # outstanding deferred (asynchronous) server-side auth decision:
+        # a (seq, username, method, pubkey_context) tuple, or None
+        self.pending_auth = None
+        self._pending_seq = 0
+        self._lock = threading.RLock()
 
     def _log(self, *args):
         return self.transport._log(*args)
@@ -143,6 +148,11 @@ class AuthHandler:
             self.transport.lock.release()
 
     def abort(self):
+        with self._lock:
+            # Any outstanding deferred decision is now moot. Drop it so a
+            # verdict arriving later (or one that races this shutdown) cannot
+            # touch the dead transport.
+            self.pending_auth = None
         if self.auth_event is not None:
             self.auth_event.set()
 
@@ -366,32 +376,42 @@ class AuthHandler:
                 DEBUG, 'Service request "{}" accepted (?)'.format(service)
             )
 
-    def _send_auth_result(self, username, method, result):
-        # okay, send result
+    def _send_auth_result(self, username, method, result, send=None):
+        # Build the verdict message and update shared auth state under our
+        # lock, as this may run either on the transport thread (synchronous
+        # callbacks) or an arbitrary application thread (deferred verdict).
+        if send is None:
+            send = self.transport._send_message
         m = Message()
-        if result == AUTH_SUCCESSFUL:
-            self._log(INFO, "Auth granted ({}).".format(method))
-            m.add_byte(cMSG_USERAUTH_SUCCESS)
-            self.authenticated = True
-        else:
-            self._log(INFO, "Auth rejected ({}).".format(method))
-            m.add_byte(cMSG_USERAUTH_FAILURE)
-            m.add_string(
-                self.transport.server_object.get_allowed_auths(username)
-            )
-            if result == AUTH_PARTIALLY_SUCCESSFUL:
-                m.add_boolean(True)
+        with self._lock:
+            if result == AUTH_SUCCESSFUL:
+                self._log(INFO, "Auth granted ({}).".format(method))
+                m.add_byte(cMSG_USERAUTH_SUCCESS)
+                self.authenticated = True
             else:
-                m.add_boolean(False)
-                self.auth_fail_count += 1
-        self.transport._send_message(m)
-        if self.auth_fail_count >= 10:
+                self._log(INFO, "Auth rejected ({}).".format(method))
+                m.add_byte(cMSG_USERAUTH_FAILURE)
+                m.add_string(
+                    self.transport.server_object.get_allowed_auths(username)
+                )
+                if result == AUTH_PARTIALLY_SUCCESSFUL:
+                    m.add_boolean(True)
+                else:
+                    m.add_boolean(False)
+                    self.auth_fail_count += 1
+            fail_count = self.auth_fail_count
+        # Deferred verdicts use the clear-to-send gated path so they never
+        # interleave with an in-progress rekey (which the app thread can race).
+        send(m)
+        if fail_count >= 10:
             self._disconnect_no_more_auth()
         if result == AUTH_SUCCESSFUL:
             self.transport._auth_trigger()
 
-    def _interactive_query(self, q):
+    def _interactive_query(self, q, send=None):
         # make interactive query instead of response
+        if send is None:
+            send = self.transport._send_message
         m = Message()
         m.add_byte(cMSG_USERAUTH_INFO_REQUEST)
         m.add_string(q.name)
@@ -401,7 +421,112 @@ class AuthHandler:
         for p in q.prompts:
             m.add_string(p[0])
             m.add_boolean(p[1])
-        self.transport._send_message(m)
+        send(m)
+
+    def _settle_auth_result(self, username, method, result, pubkey=None):
+        """
+        Act on a ``check_auth_*`` callback's return value.
+
+        An `.AuthDeferred` verdict is parked until the application completes
+        it; anything else is finalized immediately, exactly as before.
+        """
+        if isinstance(result, AuthDeferred):
+            self._defer_auth(username, method, result, pubkey=pubkey)
+        else:
+            self._finalize_auth_result(username, method, result, pubkey)
+
+    def _defer_auth(self, username, method, deferred, pubkey=None):
+        """
+        Park a deferred authentication decision returned by a server callback.
+
+        ``pubkey`` is the context needed to answer the unsigned public-key
+        probe and verify the signature once the verdict arrives.
+        """
+        with self._lock:
+            self._pending_seq += 1
+            seq = self._pending_seq
+            self.pending_auth = (seq, username, method, pubkey)
+        deferred._bind(
+            lambda result, seq=seq: self._finish_deferred_auth(seq, result)
+        )
+
+    def _finish_deferred_auth(self, seq, result):
+        """
+        Apply a deferred verdict, supplied on an arbitrary application thread.
+
+        Stale verdicts (client disconnect, superseded request, late
+        double-completion) are ignored so the application may always call
+        `.AuthDeferred.complete` safely.
+        """
+        with self._lock:
+            pending = self.pending_auth
+            if pending is None or pending[0] != seq:
+                self._log(
+                    DEBUG, "Ignoring stale or superseded deferred auth verdict"
+                )
+                return
+            # Consume the slot before doing any I/O so concurrent disconnects
+            # and further requests cannot observe a half-settled state.
+            self.pending_auth = None
+            username, method, pubkey = pending[1], pending[2], pending[3]
+            try:
+                active = self.transport.is_active()
+            except ReferenceError:
+                return
+        if not active:
+            self._log(
+                DEBUG, "Ignoring deferred auth verdict: transport is closed"
+            )
+            return
+        try:
+            self._finalize_auth_result(
+                username,
+                method,
+                result,
+                pubkey,
+                send=self.transport._send_user_message,
+            )
+        except (OSError, SSHException) as e:
+            # The transport can go away (or its socket die) while the verdict
+            # was in flight; a late decision must be harmless.
+            self._log(
+                DEBUG, "Dropping deferred auth verdict: {}".format(e)
+            )
+
+    def _finalize_auth_result(
+        self, username, method, result, pubkey=None, send=None
+    ):
+        """
+        Send the protocol response for an auth verdict.
+
+        Handles the public-key unsigned probe and signature verification, and
+        keyboard-interactive queries; everything else becomes a
+        USERAUTH_SUCCESS/FAILURE message.
+        """
+        if send is None:
+            send = self.transport._send_message
+        if pubkey is not None and result != AUTH_FAILED:
+            key, sig_attached, algorithm, keyblob, sig = pubkey
+            if not sig_attached:
+                # client wants to know if this key is acceptable, before it
+                # signs anything... send special "ok" message
+                m = Message()
+                m.add_byte(cMSG_USERAUTH_PK_OK)
+                m.add_string(algorithm)
+                m.add_string(keyblob)
+                send(m)
+                return
+            blob = self._get_session_blob(
+                key, "ssh-connection", username, algorithm
+            )
+            if not key.verify_ssh_sig(blob, sig):
+                self._log(INFO, "Auth rejected: invalid signature")
+                result = AUTH_FAILED
+        if isinstance(result, InteractiveQuery):
+            # make interactive query instead of response
+            self._interactive_query(result, send=send)
+            return
+        self._send_auth_result(username, method, result, send=send)
 
     def _parse_userauth_request(self, m):
         if not self.transport.server_mode:
@@ -414,6 +539,16 @@ class AuthHandler:
             return
         if self.authenticated:
             # ignore
+            return
+        if self.pending_auth is not None:
+            # RFC 4252 requires the client to wait for our verdict before
+            # sending another auth request; refuse to interleave attempts.
+            self._log(
+                WARNING,
+                "Auth request while an earlier auth decision is still"
+                " pending; disconnecting",
+            )
+            self._disconnect_no_more_auth()
             return
         username = m.get_text()
         service = m.get_text()
@@ -493,6 +628,17 @@ class AuthHandler:
             result = self.transport.server_object.check_auth_publickey(
                 username, key
             )
+            if isinstance(result, AuthDeferred):
+                # park the request (including its signed blob, if any); the
+                # probe reply and signature verification wait for the verdict
+                sig = Message(m.get_binary()) if sig_attached else None
+                self._settle_auth_result(
+                    username,
+                    method,
+                    result,
+                    pubkey=(key, sig_attached, algorithm, keyblob, sig),
+                )
+                return
             if result != AUTH_FAILED:
                 # key is okay, verify it
                 if not sig_attached:
@@ -516,14 +662,10 @@ class AuthHandler:
             result = self.transport.server_object.check_auth_interactive(
                 username, submethods
             )
-            if isinstance(result, InteractiveQuery):
-                # make interactive query instead of response
-                self._interactive_query(result)
-                return
         else:
             result = self.transport.server_object.check_auth_none(username)
-        # okay, send result
-        self._send_auth_result(username, method, result)
+        # okay, send result (now, or once a deferred verdict is completed)
+        self._settle_auth_result(username, method, result)
 
     def _parse_userauth_success(self, m):
         self._log(
@@ -601,11 +743,7 @@ class AuthHandler:
         result = self.transport.server_object.check_auth_interactive_response(
             responses
         )
-        if isinstance(result, InteractiveQuery):
-            # make interactive query instead of response
-            self._interactive_query(result)
-            return
-        self._send_auth_result(
+        self._settle_auth_result(
             self.auth_username, "keyboard-interactive", result
         )
 

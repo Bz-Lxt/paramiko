@@ -29,6 +29,7 @@ from paramiko.common import (
     ERROR,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
 )
+from paramiko.ssh_exception import SSHException
 
 
 class ServerInterface:
@@ -39,6 +40,13 @@ class ServerInterface:
     Methods on this class are called from Paramiko's primary thread, so you
     shouldn't do too much work in them.  (Certainly nothing that blocks or
     sleeps.)
+
+    The ``check_auth_*`` methods are the exception to that rule: if reaching
+    an authentication verdict requires slow local work, they may return an
+    `.AuthDeferred` instead of their normal return value, and the verdict can
+    be supplied later (from another thread) via `.AuthDeferred.complete`.
+    While the decision is pending, the connection keeps processing protocol
+    messages (such as rekeys) instead of being blocked.
     """
 
     def check_channel_request(self, kind, chanid):
@@ -114,11 +122,16 @@ class ServerInterface:
 
         The default implementation always returns ``AUTH_FAILED``.
 
+        To decide asynchronously, return an `.AuthDeferred` and call its
+        `~.AuthDeferred.complete` method with the verdict once it is known;
+        the connection keeps processing protocol messages in the meantime.
+
         :param str username: the username of the client.
         :return:
             ``AUTH_FAILED`` if the authentication fails; ``AUTH_SUCCESSFUL`` if
-            it succeeds.
-        :rtype: int
+            it succeeds; an `.AuthDeferred` if the verdict will be supplied
+            later.
+        :rtype: int or `.AuthDeferred`
         """
         return AUTH_FAILED
 
@@ -137,13 +150,19 @@ class ServerInterface:
 
         The default implementation always returns ``AUTH_FAILED``.
 
+        To decide asynchronously (for example when checking the password
+        requires a slow local operation), return an `.AuthDeferred` and call
+        its `~.AuthDeferred.complete` method with the verdict once it is known;
+        the connection keeps processing protocol messages in the meantime.
+
         :param str username: the username of the authenticating client.
         :param str password: the password given by the client.
         :return:
             ``AUTH_FAILED`` if the authentication fails; ``AUTH_SUCCESSFUL`` if
             it succeeds; ``AUTH_PARTIALLY_SUCCESSFUL`` if the password auth is
-            successful, but authentication must continue.
-        :rtype: int
+            successful, but authentication must continue; an `.AuthDeferred` if
+            the verdict will be supplied later.
+        :rtype: int or `.AuthDeferred`
         """
         return AUTH_FAILED
 
@@ -164,18 +183,26 @@ class ServerInterface:
 
         Note that you don't have to actually verify any key signtature here.
         If you're willing to accept the key, Paramiko will do the work of
-        verifying the client's signature.
+        verifying the client's signature, including when the verdict is
+        supplied via an `.AuthDeferred`.
 
         The default implementation always returns ``AUTH_FAILED``.
 
-        :param str username: the username of the authenticating client
+        To decide asynchronously, return an `.AuthDeferred` and call its
+        `~.AuthDeferred.complete` method with the verdict once it is known;
+        the unsigned public-key probe (``USERAUTH_PK_OK``) and signature
+        verification are both held off until then, and the connection keeps
+        processing protocol messages in the meantime.
+
+        :param .PKey username: the username of the authenticating client
         :param .PKey key: the key object provided by the client
         :return:
             ``AUTH_FAILED`` if the client can't authenticate with this key;
             ``AUTH_SUCCESSFUL`` if it can; ``AUTH_PARTIALLY_SUCCESSFUL`` if it
             can authenticate with this key but must continue with
-            authentication
-        :rtype: int
+            authentication; an `.AuthDeferred` if the verdict will be supplied
+            later
+        :rtype: int or `.AuthDeferred`
         """
         return AUTH_FAILED
 
@@ -193,14 +220,19 @@ class ServerInterface:
 
         The default implementation always returns ``AUTH_FAILED``.
 
+        To decide asynchronously, return an `.AuthDeferred` and complete it
+        later with either an int verdict or an `.InteractiveQuery`; the
+        connection keeps processing protocol messages in the meantime.
+
         :param str username: the username of the authenticating client
         :param str submethods:
             a comma-separated list of methods preferred by the client (usually
             empty)
         :return:
             ``AUTH_FAILED`` if this auth method isn't supported; otherwise an
-            object containing queries for the user
-        :rtype: int or `.InteractiveQuery`
+            object containing queries for the user; an `.AuthDeferred` if that
+            verdict or query will be supplied later
+        :rtype: int or `.InteractiveQuery` or `.AuthDeferred`
         """
         return AUTH_FAILED
 
@@ -225,13 +257,18 @@ class ServerInterface:
 
         The default implementation always returns ``AUTH_FAILED``.
 
+        To decide asynchronously, return an `.AuthDeferred` and complete it
+        later with an int verdict or another `.InteractiveQuery`; the
+        connection keeps processing protocol messages in the meantime.
+
         :param responses: list of `str` responses from the client
         :return:
             ``AUTH_FAILED`` if the authentication fails; ``AUTH_SUCCESSFUL`` if
             it succeeds; ``AUTH_PARTIALLY_SUCCESSFUL`` if the interactive auth
             is successful, but authentication must continue; otherwise an
-            object containing queries for the user
-        :rtype: int or `.InteractiveQuery`
+            object containing queries for the user; an `.AuthDeferred` if that
+            verdict or query will be supplied later
+        :rtype: int or `.InteractiveQuery` or `.AuthDeferred`
         """
         return AUTH_FAILED
 
@@ -559,6 +596,135 @@ class InteractiveQuery:
             ``False`` if not (for a password or similar)
         """
         self.prompts.append((prompt, echo))
+
+
+class AuthDeferred:
+    """
+    A deferred (asynchronous) server-side authentication decision.
+
+    A ``check_auth_*`` method on `.ServerInterface` may return an instance of
+    this class instead of its usual int verdict (or `.InteractiveQuery`), when
+    reaching the verdict requires work that must not block the connection --
+    such as a database lookup, a call to an external service, or anything that
+    sleeps.  While the decision is outstanding, Paramiko's transport thread
+    keeps processing protocol messages (notably rekey requests), instead of
+    being stuck inside the callback.
+
+    Typical use::
+
+        class MyServer(ServerInterface):
+            def check_auth_password(self, username, password):
+                deferred = AuthDeferred()
+
+                def worker():
+                    # runs on your own thread; do the slow work here
+                    verdict = (
+                        AUTH_SUCCESSFUL
+                        if my_slow_verifier(username, password)
+                        else AUTH_FAILED
+                    )
+                    deferred.complete(verdict)
+
+                threading.Thread(target=worker, daemon=True).start()
+                return deferred
+
+    The value passed to `complete` is exactly what the synchronous callback
+    would have returned: ``AUTH_SUCCESSFUL``, ``AUTH_FAILED`` or
+    ``AUTH_PARTIALLY_SUCCESSFUL`` (and, for the keyboard-interactive callbacks,
+    an `.InteractiveQuery` is also allowed).  Multi-round authentication
+    (``AUTH_PARTIALLY_SUCCESSFUL`` followed by another request) works the same
+    as with synchronous verdicts.
+
+    Only one decision per connection may be outstanding at a time, since the
+    client is required (per RFC 4252) to wait for the verdict before sending
+    another authentication request.  A verdict completed after the client has
+    disconnected, or after the decision has otherwise been superseded, is
+    silently ignored, so it is always safe to call `complete`.
+
+    .. versionadded:: 5.0
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._result = None
+        self._callback = None
+
+    def ready(self):
+        """
+        Return whether `complete` has already been called.
+
+        :rtype: bool
+        """
+        return self._event.is_set()
+
+    @property
+    def result(self):
+        """
+        The verdict passed to `complete`, or ``None`` while still pending.
+        """
+        return self._result
+
+    def wait(self, timeout=None):
+        """
+        Block until the verdict has been supplied.
+
+        :param float timeout:
+            optional maximum number of seconds to wait.
+        :return:
+            ``True`` if `complete` was called, ``False`` if the timeout
+            elapsed first.
+        :rtype: bool
+        """
+        return self._event.wait(timeout)
+
+    def complete(self, result):
+        """
+        Supply the final verdict for this authentication attempt.
+
+        This may be called from any thread.  Paramiko then behaves exactly as
+        if the original ``check_auth_*`` callback had returned ``result``
+        synchronously: the appropriate success/failure message is sent to the
+        client, signature verification runs for accepted public keys, and so
+        on.
+
+        Calling this more than once raises `.SSHException`; a call that
+        arrives after the client has disconnected or after the decision was
+        superseded is ignored instead of affecting the connection.
+
+        :param result:
+            ``AUTH_SUCCESSFUL``, ``AUTH_FAILED``,
+            ``AUTH_PARTIALLY_SUCCESSFUL``, or (for keyboard-interactive
+            callbacks) an `.InteractiveQuery`.
+        """
+        with self._lock:
+            if self._event.is_set():
+                raise SSHException(
+                    "This authentication decision has already been completed"
+                )
+            self._result = result
+            self._event.set()
+            callback = self._callback
+        if callback is not None:
+            callback(result)
+
+    def _bind(self, callback):
+        """
+        Register the handler to run once the verdict is supplied.
+
+        If `complete` was called before this method, run ``callback``
+        immediately with the already-supplied verdict.
+        """
+        with self._lock:
+            if self._event.is_set():
+                result = self._result
+                bound = False
+            else:
+                self._callback = callback
+                result = None
+                bound = True
+        if not bound:
+            callback(result)
 
 
 class SubsystemHandler(threading.Thread):
