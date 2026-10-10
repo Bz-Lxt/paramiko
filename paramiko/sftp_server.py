@@ -262,18 +262,22 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         self._response(request_number, CMD_STATUS, code, desc, "")
 
     def _open_folder(self, request_number, path):
-        resp = self.server.list_folder(path)
-        if issubclass(type(resp), list):
-            # got an actual list of filenames in the folder
-            folder = SFTPHandle()
-            folder._set_files(resp)
-            self._send_handle_response(request_number, folder, True)
+        resp = self.server.list_folder_iter(path)
+        if isinstance(resp, int):
+            # must be an error code
+            self._send_status(request_number, resp)
             return
-        # must be an error code
-        self._send_status(request_number, resp)
+        # got a (possibly lazy) iterator of SFTPAttributes for the folder
+        folder = SFTPHandle()
+        folder._set_files_iter(resp)
+        self._send_handle_response(request_number, folder, True)
 
     def _read_folder(self, request_number, folder):
         flist = folder._get_next_files()
+        if isinstance(flist, int):
+            # lazy enumeration failed mid-listing
+            self._send_status(request_number, flist)
+            return
         if len(flist) == 0:
             self._send_status(request_number, SFTP_EOF)
             return
@@ -386,7 +390,8 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         elif t == CMD_CLOSE:
             handle = msg.get_binary()
             if handle in self.folder_table:
-                del self.folder_table[handle]
+                folder = self.folder_table.pop(handle)
+                folder.close()
                 self._send_status(request_number, SFTP_OK)
                 return
             if handle in self.file_table:

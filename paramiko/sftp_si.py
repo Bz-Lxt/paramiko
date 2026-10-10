@@ -139,6 +139,55 @@ class SFTPServerInterface:
         """
         return SFTP_OP_UNSUPPORTED
 
+    def list_folder_iter(self, path):
+        """
+        Return an iterator of `.SFTPAttributes` objects describing the files
+        within a given folder -- a lazy alternative to `list_folder`.
+
+        The ``path`` uses the same posix notation as in `list_folder`.
+        Override this method (typically with a generator function) to
+        enumerate the directory entry by entry instead of building the
+        complete listing up front, so memory usage stays low even for very
+        large directories.  Each yielded object should have its ``filename``
+        field filled in, the same way `list_folder` requires.
+
+        To signal an error while opening the directory, return one of the
+        ``SFTP_*`` error codes (such as ``SFTP_PERMISSION_DENIED``) instead
+        of an iterator.
+
+        Acquire any resources needed for enumeration (such as an
+        ``os.scandir`` context manager) *inside* the generator body; they
+        are opened lazily on the first read, so nothing leaks if the handle
+        is closed before a single entry is requested.
+
+        The iterator is closed -- so ``finally`` blocks and context managers
+        in a generator implementation run -- when the listing is fully
+        consumed, when the client closes the directory handle before
+        consuming every entry, when the SFTP session ends, or when producing
+        an entry raises an exception.  A raised exception also causes an
+        ``SFTP_FAILURE`` status (or a more specific status for ``OSError``)
+        to be sent for the failing read request.
+
+        Each open directory gets its own iterator, so concurrently open
+        directories do not interfere with each other.
+
+        The default implementation calls `list_folder` and iterates over the
+        returned list, so implementations that only override `list_folder`
+        keep working unchanged.
+
+        :param str path: the requested path (relative or absolute) to be
+            listed.
+        :return:
+            an iterator of `.SFTPAttributes` objects, or an SFTP error code
+            `int`.
+
+        .. versionadded:: 5.0
+        """
+        result = self.list_folder(path)
+        if isinstance(result, int):
+            return result
+        return iter(result)
+
     def stat(self, path):
         """
         Return an `.SFTPAttributes` object for a path on the server, or an

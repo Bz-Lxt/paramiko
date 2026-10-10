@@ -21,7 +21,7 @@ Abstraction of an SFTP file handle (for server mode).
 """
 
 import os
-from paramiko.sftp import SFTP_OP_UNSUPPORTED, SFTP_OK
+from paramiko.sftp import SFTP_FAILURE, SFTP_OP_UNSUPPORTED, SFTP_OK
 from paramiko.util import ClosingContextManager
 
 
@@ -48,8 +48,10 @@ class SFTPHandle(ClosingContextManager):
         """
         self.__flags = flags
         self.__name = None
-        # only for handles to folders:
-        self.__files = {}
+        # for handles to folders: __files caches a fully materialized
+        # listing, while __files_iter streams a (possibly lazy) listing
+        self.__files = []
+        self.__files_iter = None
         self.__tell = None
 
     def close(self):
@@ -70,6 +72,8 @@ class SFTPHandle(ClosingContextManager):
         writefile = getattr(self, "writefile", None)
         if writefile is not None:
             writefile.close()
+        # release any in-progress lazy directory enumeration
+        self._close_files_iter()
 
     def read(self, offset, length):
         """
@@ -177,13 +181,61 @@ class SFTPHandle(ClosingContextManager):
         """
         self.__files = files
 
+    def _set_files_iter(self, files):
+        """
+        Used by the SFTP server code to attach a (possibly lazy) iterator
+        of `.SFTPAttributes` to a directory handle, instead of caching a
+        complete listing up front.
+        """
+        self.__files_iter = iter(files)
+
+    def _close_files_iter(self):
+        """
+        Close a lazy directory listing iterator, running any cleanup
+        (``finally`` blocks, context managers) in the underlying
+        generator.  Safe to call more than once.
+        """
+        files_iter = self.__files_iter
+        if files_iter is None:
+            return
+        self.__files_iter = None
+        close = getattr(files_iter, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception:
+            # a generator may raise while unwinding (eg. from a finally
+            # block); closing the handle must still succeed
+            pass
+
     def _get_next_files(self):
         """
-        Used by the SFTP server code to retrieve a cached directory
-        listing.
+        Used by the SFTP server code to retrieve the next batch (up to 16
+        entries) of a directory listing.
+
+        Returns a list of `.SFTPAttributes` objects (empty when the
+        listing is exhausted), or an SFTP error code `int` if a lazy
+        iterator raises while producing entries.
         """
-        fnlist = self.__files[:16]
-        self.__files = self.__files[16:]
+        if self.__files_iter is None:
+            # cached, fully materialized listing
+            fnlist = self.__files[:16]
+            self.__files = self.__files[16:]
+            return fnlist
+        fnlist = []
+        for _ in range(16):
+            try:
+                fnlist.append(next(self.__files_iter))
+            except StopIteration:
+                self._close_files_iter()
+                break
+            except OSError as e:
+                self._close_files_iter()
+                return SFTPServer.convert_errno(e.errno)
+            except Exception:
+                self._close_files_iter()
+                return SFTP_FAILURE
         return fnlist
 
     def _get_name(self):

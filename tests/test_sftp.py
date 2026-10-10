@@ -23,9 +23,12 @@ a real actual sftp server is contacted, and a new folder is created there to
 do test file operations in (so no existing files will be harmed).
 """
 
+import errno
 import os
+import shutil
 import socket
 import sys
+import threading
 import warnings
 from binascii import hexlify
 from io import StringIO
@@ -33,11 +36,32 @@ from tempfile import mkstemp
 
 import pytest
 
+from paramiko import (
+    RSAKey,
+    SFTP,
+    SFTPHandle,
+    SFTP_FAILURE,
+    SFTP_PERMISSION_DENIED,
+    SFTPServer,
+    SFTPServerInterface,
+    Transport,
+)
 from paramiko.common import o777, o600, o666, o644
+from paramiko.sftp import (
+    CMD_CLOSE,
+    CMD_HANDLE,
+    CMD_NAME,
+    CMD_OPENDIR,
+    CMD_READDIR,
+    CMD_STATUS,
+)
 from paramiko.sftp_attr import SFTPAttributes
 from paramiko.util import b, u
 from tests import requireNonAsciiLocale
 
+from ._loop import LoopSocket
+from ._stub_sftp import StubServer, StubSFTPServer
+from ._util import _support
 from ._util import needs_builtin
 from ._util import slow
 
@@ -830,3 +854,389 @@ class TestSFTP:
                 assert f.read() == data
         finally:
             sftp.remove(f"{sftp.FOLDER}/write_memoryview")
+
+
+def _named_attr(name):
+    attr = SFTPAttributes()
+    attr.filename = name
+    return attr
+
+
+class TestSFTPHandleLazyFiles:
+    """
+    Unit tests for iterator-backed (lazy) directory handles, without a
+    network connection.
+    """
+
+    def test_batches_of_16_then_eof(self):
+        handle = SFTPHandle()
+        closed = []
+
+        def generate():
+            try:
+                for i in range(40):
+                    yield _named_attr(f"f{i}")
+            finally:
+                closed.append(True)
+
+        handle._set_files_iter(generate())
+        batches = [handle._get_next_files() for _ in range(3)]
+        assert [len(x) for x in batches] == [16, 16, 8]
+        assert [a.filename for a in batches[0]] == [
+            f"f{i}" for i in range(16)
+        ]
+        # exhausted listing stays at EOF, and the generator was released
+        assert handle._get_next_files() == []
+        assert handle._get_next_files() == []
+        assert closed == [True]
+
+    def test_close_stops_unconsumed_enumeration(self):
+        handle = SFTPHandle()
+        yielded = []
+        closed = []
+
+        def generate():
+            try:
+                for i in range(40):
+                    yielded.append(i)
+                    yield _named_attr(f"f{i}")
+            finally:
+                closed.append(True)
+
+        handle._set_files_iter(generate())
+        assert len(handle._get_next_files()) == 16
+        handle.close()
+        assert closed == [True]
+        # the generator stopped at the first batch, and reads now hit EOF
+        assert yielded == list(range(16))
+        assert handle._get_next_files() == []
+
+    def test_close_without_any_reads(self):
+        # a generator whose body never started (no READDIR) is closed as a
+        # no-op by Python; acquire resources *inside* the generator and
+        # nothing has been opened yet at this point
+        handle = SFTPHandle()
+        started = []
+
+        def generate():
+            started.append(True)
+            try:
+                yield _named_attr("f0")
+            finally:
+                started.append(False)
+
+        handle._set_files_iter(generate())
+        handle.close()
+        assert started == []
+        assert handle._get_next_files() == []
+
+    def test_oserror_becomes_sftp_status(self):
+        handle = SFTPHandle()
+        closed = []
+
+        def generate():
+            try:
+                for i in range(17):
+                    yield _named_attr(f"f{i}")
+                raise OSError(errno.EACCES, "denied")
+            finally:
+                closed.append(True)
+
+        handle._set_files_iter(generate())
+        first = handle._get_next_files()
+        assert [a.filename for a in first] == [f"f{i}" for i in range(16)]
+        # the next batch hits the error and reports a status code
+        assert handle._get_next_files() == SFTP_PERMISSION_DENIED
+        assert closed == [True]
+        # enumeration is over: subsequent reads just hit EOF
+        assert handle._get_next_files() == []
+
+    def test_generic_exception_becomes_failure(self):
+        handle = SFTPHandle()
+
+        def generate():
+            for i in range(17):
+                yield _named_attr(f"f{i}")
+            raise RuntimeError("boom")
+
+        handle._set_files_iter(generate())
+        assert len(handle._get_next_files()) == 16
+        assert handle._get_next_files() == SFTP_FAILURE
+        assert handle._get_next_files() == []
+
+    def test_close_swallows_exception_from_generator_teardown(self):
+        handle = SFTPHandle()
+
+        def generate():
+            try:
+                yield _named_attr("f0")
+            finally:
+                raise RuntimeError("boom during GeneratorExit")
+
+        handle._set_files_iter(generate())
+        handle._get_next_files()
+        # closing the handle must succeed even if the generator raises
+        # while unwinding
+        handle.close()
+        assert handle._get_next_files() == []
+
+    def test_handles_are_independent(self):
+        handle_a = SFTPHandle()
+        handle_b = SFTPHandle()
+
+        def generate(prefix):
+            for i in range(20):
+                yield _named_attr(f"{prefix}{i}")
+
+        handle_a._set_files_iter(generate("a"))
+        handle_b._set_files_iter(generate("b"))
+
+        batch_a = handle_a._get_next_files()
+        batch_b = handle_b._get_next_files()
+        assert [x.filename for x in batch_a] == [f"a{i}" for i in range(16)]
+        assert [x.filename for x in batch_b] == [f"b{i}" for i in range(16)]
+
+        # closing B early does not affect A's position
+        handle_b.close()
+        rest_a = handle_a._get_next_files()
+        assert [x.filename for x in rest_a] == [
+            f"a{i}" for i in range(16, 20)
+        ]
+        assert handle_a._get_next_files() == []
+
+    def test_legacy_materialized_list_still_works(self):
+        handle = SFTPHandle()
+        handle._set_files([_named_attr(f"f{i}") for i in range(40)])
+        assert len(handle._get_next_files()) == 16
+        assert len(handle._get_next_files()) == 16
+        assert len(handle._get_next_files()) == 8
+        assert handle._get_next_files() == []
+
+
+class TestListFolderIterDefault:
+    """
+    The default list_folder_iter() must preserve list_folder()-based
+    implementations: lists become iterators, error codes pass through.
+    """
+
+    def test_wraps_returned_list(self):
+        attrs = [_named_attr("f0"), _named_attr("f1")]
+
+        class Iface(SFTPServerInterface):
+            def list_folder(self, path):
+                return attrs
+
+        assert list(Iface(None).list_folder_iter("/p")) == attrs
+
+    def test_passes_error_code_through(self):
+        class Iface(SFTPServerInterface):
+            def list_folder(self, path):
+                return SFTP_PERMISSION_DENIED
+
+        assert Iface(None).list_folder_iter("/p") == SFTP_PERMISSION_DENIED
+
+
+class _RecordingLazySFTPServer(StubSFTPServer):
+    """
+    Loopback SFTP interface that streams listings from a generator (using
+    os.scandir), with knobs for failure injection and class-level recording
+    of generator cleanup via try/finally.
+    """
+
+    closed = []
+    fail_after = None
+    open_error = None
+    list_folder_calls = 0
+
+    def list_folder(self, path):
+        type(self).list_folder_calls += 1
+        return super().list_folder(path)
+
+    def list_folder_iter(self, path):
+        realpath = self._realpath(path)
+        cls = type(self)
+        if cls.open_error is not None:
+            error = cls.open_error
+            cls.open_error = None
+            return error
+
+        def generate():
+            try:
+                # sorting keeps on-disk entry order irrelevant to batch
+                # assertions, while scandir stays open across yields so the
+                # early-close path really releases an OS resource
+                with os.scandir(realpath) as entries:
+                    ordered = sorted(entries, key=lambda entry: entry.name)
+                    for index, entry in enumerate(ordered):
+                        if (
+                            cls.fail_after is not None
+                            and index >= cls.fail_after
+                        ):
+                            raise OSError(errno.EIO, "synthetic failure")
+                        attr = SFTPAttributes.from_stat(
+                            entry.stat(follow_symlinks=False)
+                        )
+                        attr.filename = entry.name
+                        yield attr
+            finally:
+                cls.closed.append(realpath)
+
+        return generate()
+
+
+LAZY_FOLDER = "paramiko-lazy-test-target"
+
+
+@pytest.fixture
+def lazy_sftp():
+    # reset recording/knobs on the interface class
+    _RecordingLazySFTPServer.closed = []
+    _RecordingLazySFTPServer.fail_after = None
+    _RecordingLazySFTPServer.open_error = None
+    _RecordingLazySFTPServer.list_folder_calls = 0
+
+    shutil.rmtree(LAZY_FOLDER, ignore_errors=True)
+    os.mkdir(LAZY_FOLDER)
+
+    socks = LoopSocket()
+    sockc = LoopSocket()
+    sockc.link(socks)
+    tc = Transport(sockc)
+    ts = Transport(socks)
+    ts.add_server_key(RSAKey.from_private_key_file(_support("rsa.key")))
+    event = threading.Event()
+    ts.set_subsystem_handler("sftp", SFTPServer, _RecordingLazySFTPServer)
+    ts.start_server(event, StubServer())
+    event.wait(1.0)
+    tc.connect(username="slowdive", password="pygmalion")
+    client = SFTP.from_transport(tc)
+    yield client
+    client.close()
+    tc.close()
+    ts.close()
+    shutil.rmtree(LAZY_FOLDER, ignore_errors=True)
+
+
+def _server_realpath(*parts):
+    return os.path.join(StubSFTPServer.ROOT, LAZY_FOLDER, *parts)
+
+
+def _names_from_readdir_reply(msg):
+    count = msg.get_int()
+    names = set()
+    for _ in range(count):
+        names.add(msg.get_text())
+        msg.get_text()  # longname
+        SFTPAttributes._from_msg(msg)
+    return names
+
+
+@slow
+class TestLazySFTPListing:
+    """
+    End-to-end (loopback SFTP) tests for streaming directory enumeration.
+    """
+
+    def _make_files(self, subdir=None, count=20, prefix="file"):
+        target = (
+            LAZY_FOLDER if subdir is None else f"{LAZY_FOLDER}/{subdir}"
+        )
+        os.makedirs(target, exist_ok=True)
+        for i in range(count):
+            with open(f"{target}/{prefix}{i:03d}", "w"):
+                pass
+        return target
+
+    def test_full_streaming_listing(self, lazy_sftp):
+        # more than one 16-entry batch, so multiple READDIR round trips
+        self._make_files(count=40)
+        names = lazy_sftp.listdir(LAZY_FOLDER)
+        assert sorted(names) == sorted(f"file{i:03d}" for i in range(40))
+        # the streaming hook served the listing; list_folder() was never
+        # forced to build the complete list
+        assert _RecordingLazySFTPServer.list_folder_calls == 0
+        # consuming to EOF released the enumerator exactly once
+        assert _RecordingLazySFTPServer.closed == [_server_realpath()]
+
+    def test_early_client_close_releases_enumerator(self, lazy_sftp):
+        self._make_files(count=40)
+        t, msg = lazy_sftp._request(CMD_OPENDIR, LAZY_FOLDER)
+        assert t == CMD_HANDLE
+        handle = msg.get_binary()
+        try:
+            t, msg = lazy_sftp._request(CMD_READDIR, handle)
+            assert t == CMD_NAME
+            assert msg.get_int() == 16
+            # 24 entries are still unread; the generator is merely suspended
+            assert _RecordingLazySFTPServer.closed == []
+        finally:
+            t, msg = lazy_sftp._request(CMD_CLOSE, handle)
+        assert t == CMD_STATUS
+        # client CLOSE before EOF runs the generator's finally cleanup
+        assert _RecordingLazySFTPServer.closed == [_server_realpath()]
+
+    def test_failure_mid_listing(self, lazy_sftp):
+        self._make_files(count=40)
+        _RecordingLazySFTPServer.fail_after = 5
+        t, msg = lazy_sftp._request(CMD_OPENDIR, LAZY_FOLDER)
+        assert t == CMD_HANDLE
+        handle = msg.get_binary()
+        # the batch dies producing entry #6: failure status, and the
+        # partially built batch is not sent
+        with pytest.raises(IOError):
+            lazy_sftp._request(CMD_READDIR, handle)
+        # the dying enumerator is released immediately
+        assert _RecordingLazySFTPServer.closed == [_server_realpath()]
+        # the handle is still valid and closes cleanly afterwards
+        t, msg = lazy_sftp._request(CMD_CLOSE, handle)
+        assert t == CMD_STATUS
+        # close after failure must not re-enter the dead generator
+        assert _RecordingLazySFTPServer.closed == [_server_realpath()]
+
+    def test_error_opening_directory(self, lazy_sftp):
+        self._make_files(count=3)
+        _RecordingLazySFTPServer.open_error = SFTP_PERMISSION_DENIED
+        with pytest.raises(PermissionError):
+            lazy_sftp.listdir(LAZY_FOLDER)
+        # no enumerator was ever created
+        assert _RecordingLazySFTPServer.closed == []
+
+    def test_concurrent_open_directories_are_independent(self, lazy_sftp):
+        self._make_files(subdir="a", count=20, prefix="a")
+        self._make_files(subdir="b", count=20, prefix="b")
+        t, msg_a = lazy_sftp._request(CMD_OPENDIR, f"{LAZY_FOLDER}/a")
+        assert t == CMD_HANDLE
+        handle_a = msg_a.get_binary()
+        t, msg_b = lazy_sftp._request(CMD_OPENDIR, f"{LAZY_FOLDER}/b")
+        assert t == CMD_HANDLE
+        handle_b = msg_b.get_binary()
+        try:
+            _, reply_a = lazy_sftp._request(CMD_READDIR, handle_a)
+            _, reply_b = lazy_sftp._request(CMD_READDIR, handle_b)
+            first_a = _names_from_readdir_reply(reply_a)
+            first_b = _names_from_readdir_reply(reply_b)
+            assert first_a == {f"a{i:03d}" for i in range(16)}
+            assert first_b == {f"b{i:03d}" for i in range(16)}
+
+            # stop B early; A must keep its position and remain readable
+            t, _ = lazy_sftp._request(CMD_CLOSE, handle_b)
+            assert t == CMD_STATUS
+            handle_b = None
+
+            seen_a = set(first_a)
+            while True:
+                try:
+                    _, reply = lazy_sftp._request(CMD_READDIR, handle_a)
+                except EOFError:
+                    break
+                seen_a |= _names_from_readdir_reply(reply)
+            assert seen_a == {f"a{i:03d}" for i in range(20)}
+        finally:
+            if handle_b is not None:
+                lazy_sftp._request(CMD_CLOSE, handle_b)
+            lazy_sftp._request(CMD_CLOSE, handle_a)
+
+        assert set(_RecordingLazySFTPServer.closed) == {
+            _server_realpath("a"),
+            _server_realpath("b"),
+        }
